@@ -1,17 +1,18 @@
 use crate::index::{Doc, Index, Posting};
-use crate::shard::{IndexResult, index_docs};
+use crate::shard::{IndexResult, index_docs, stamp};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use xxhash_rust::xxh3::xxh3_128;
+use xxhash_rust::xxh3::{xxh3_64, xxh3_128};
 
 pub const SNAPSHOT_FILE: &str = "shard.snap";
 pub const WAL_FILE: &str = "wal.log";
 pub const FILES_DIR: &str = "files";
-pub const SNAPSHOT_MAGIC: &[u8] = b"MSNAP2\n";
+pub const SNAPSHOT_MAGIC: &[u8] = b"MSNAP3\n";
+pub const SNAPSHOT_V2_MAGIC: &[u8] = b"MSNAP2\n";
 pub const WAL_MAGIC: &[u8] = b"MSWAL2\n";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,6 +20,28 @@ pub enum Op {
     Add(Vec<Doc>),
     Delete(String),
     Update(Doc),
+    AddAt(Vec<Doc>, u64),
+    PutAt(Doc, u64),
+    DeleteAt(String, u64),
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Versions {
+    pub docs: HashMap<String, u64>,
+    pub deleted: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncEntry {
+    pub id: String,
+    pub version: u64,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Digest {
+    pub count: u64,
+    pub hash: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +106,7 @@ struct Disk {
 #[derive(Debug, Default)]
 pub struct Store {
     pub index: Index,
+    pub versions: Versions,
     disk: Option<Disk>,
     files: HashMap<String, Vec<u8>>,
     wal_ops: usize,
@@ -98,28 +122,32 @@ impl Store {
             .with_context(|| format!("create {}", dir.display()))?;
         let snap_path = dir.join(SNAPSHOT_FILE);
         let mut legacy = false;
-        let mut index = if snap_path.exists() {
+        let (mut index, mut versions) = if snap_path.exists() {
             let bytes = std::fs::read(&snap_path)
                 .with_context(|| format!("read {}", snap_path.display()))?;
-            match bytes.strip_prefix(SNAPSHOT_MAGIC) {
-                Some(rest) => postcard::from_bytes(rest)
-                    .with_context(|| format!("decode {}", snap_path.display()))?,
-                None => {
-                    legacy = true;
-                    tracing::warn!("migrating legacy snapshot");
-                    legacy_index(&bytes)
-                        .with_context(|| format!("decode {}", snap_path.display()))?
-                }
+            if let Some(rest) = bytes.strip_prefix(SNAPSHOT_MAGIC) {
+                postcard::from_bytes(rest)
+                    .with_context(|| format!("decode {}", snap_path.display()))?
+            } else if let Some(rest) = bytes.strip_prefix(SNAPSHOT_V2_MAGIC) {
+                let index = postcard::from_bytes(rest)
+                    .with_context(|| format!("decode {}", snap_path.display()))?;
+                (index, Versions::default())
+            } else {
+                legacy = true;
+                tracing::warn!("migrating legacy snapshot");
+                let index = legacy_index(&bytes)
+                    .with_context(|| format!("decode {}", snap_path.display()))?;
+                (index, Versions::default())
             }
         } else {
-            Index::new()
+            (Index::new(), Versions::default())
         };
         let wal_path = dir.join(WAL_FILE);
         let (ops, valid, legacy_wal) = read_wal_any(&wal_path)?;
         legacy |= legacy_wal;
         let wal_ops = ops.len();
         for op in ops {
-            if let Err(e) = apply(&mut index, op) {
+            if let Err(e) = apply(&mut index, &mut versions, op) {
                 tracing::warn!(error = %e, "wal replay");
             }
         }
@@ -135,6 +163,7 @@ impl Store {
         }
         let mut store = Self {
             index,
+            versions,
             disk: Some(Disk {
                 dir: dir.to_path_buf(),
                 wal,
@@ -155,40 +184,132 @@ impl Store {
         self.wal_ops
     }
 
-    pub fn add(&mut self, docs: Vec<Doc>) -> Result<IndexResult> {
-        if docs.is_empty() {
-            return Ok(IndexResult::default());
-        }
-        let op = Op::Add(docs);
-        self.log(&op)?;
-        let Op::Add(docs) = op else {
-            bail!("unexpected op");
+    pub fn version(&self, id: &str) -> u64 {
+        let doc = match self.versions.docs.get(id) {
+            Some(v) => *v,
+            None => self
+                .index
+                .ids
+                .get(id)
+                .and_then(|internal| self.index.docs.get(internal))
+                .map_or(0, |doc| doc.meta.updated.max(doc.meta.created) * 1000),
         };
-        let result = index_docs(&mut self.index, docs);
+        doc.max(self.versions.deleted.get(id).copied().unwrap_or(0))
+    }
+
+    fn next_version(&self, id: &str) -> u64 {
+        stamp().max(self.version(id) + 1)
+    }
+
+    pub fn add(&mut self, docs: Vec<Doc>) -> Result<IndexResult> {
+        let version = docs
+            .iter()
+            .map(|doc| self.version(&doc.id) + 1)
+            .fold(stamp(), u64::max);
+        self.add_at(docs, version)
+    }
+
+    pub fn add_at(&mut self, docs: Vec<Doc>, version: u64) -> Result<IndexResult> {
+        let total = docs.len();
+        let mut seen = HashSet::new();
+        let fresh: Vec<Doc> = docs
+            .into_iter()
+            .filter(|doc| {
+                !self.index.contains(&doc.id)
+                    && self.version(&doc.id) < version
+                    && seen.insert(doc.id.clone())
+            })
+            .collect();
+        if fresh.is_empty() {
+            return Ok(IndexResult {
+                indexed: 0,
+                skipped: total,
+            });
+        }
+        let added = fresh.len();
+        self.log_apply(Op::AddAt(fresh, version))?;
         self.maybe_snapshot()?;
-        result
+        Ok(IndexResult {
+            indexed: added,
+            skipped: total - added,
+        })
     }
 
     pub fn delete(&mut self, id: &str) -> Result<bool> {
         if !self.index.contains(id) {
             return Ok(false);
         }
-        self.log(&Op::Delete(id.to_string()))?;
-        let deleted = self.index.delete(id);
+        let version = self.next_version(id);
+        self.delete_at(id, version)
+    }
+
+    pub fn delete_at(&mut self, id: &str, version: u64) -> Result<bool> {
+        if version <= self.version(id) {
+            return Ok(false);
+        }
+        let existed = self.index.contains(id);
+        self.log_apply(Op::DeleteAt(id.to_string(), version))?;
         self.remove_file(id)?;
         self.maybe_snapshot()?;
-        Ok(deleted)
+        Ok(existed)
     }
 
     pub fn update(&mut self, doc: Doc) -> Result<bool> {
-        let op = Op::Update(doc);
-        self.log(&op)?;
-        let Op::Update(doc) = op else {
-            bail!("unexpected op");
-        };
-        let existed = self.index.update(doc);
+        let version = self.next_version(&doc.id);
+        Ok(self.put_at(doc, version)?.unwrap_or(true))
+    }
+
+    pub fn put_at(&mut self, doc: Doc, version: u64) -> Result<Option<bool>> {
+        if version <= self.version(&doc.id) {
+            return Ok(None);
+        }
+        let existed = self.index.contains(&doc.id);
+        self.log_apply(Op::PutAt(doc, version))?;
         self.maybe_snapshot()?;
-        existed
+        Ok(Some(existed))
+    }
+
+    fn log_apply(&mut self, op: Op) -> Result<()> {
+        self.log(&op)?;
+        apply(&mut self.index, &mut self.versions, op)
+    }
+
+    pub fn entries(&self) -> Vec<SyncEntry> {
+        let mut entries: Vec<SyncEntry> = self
+            .index
+            .ids
+            .keys()
+            .map(|id| SyncEntry {
+                id: id.clone(),
+                version: self.version(id),
+                deleted: false,
+            })
+            .chain(
+                self.versions
+                    .deleted
+                    .iter()
+                    .filter(|(id, _)| !self.index.contains(id))
+                    .map(|(id, version)| SyncEntry {
+                        id: id.clone(),
+                        version: *version,
+                        deleted: true,
+                    }),
+            )
+            .collect();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        entries
+    }
+
+    pub fn digest(&self) -> Digest {
+        let entries = self.entries();
+        let hash = entries.iter().fold(0u64, |acc, e| {
+            let key = format!("{}\0{}\0{}", e.id, e.version, e.deleted);
+            acc.wrapping_add(xxh3_64(key.as_bytes()))
+        });
+        Digest {
+            count: entries.len() as u64,
+            hash,
+        }
     }
 
     fn file_path(&self, id: &str) -> Option<PathBuf> {
@@ -255,7 +376,9 @@ impl Store {
             bail!("shard has no data dir");
         };
         let mut bytes = SNAPSHOT_MAGIC.to_vec();
-        bytes.extend(postcard::to_allocvec(&self.index).context("encode snapshot")?);
+        bytes.extend(
+            postcard::to_allocvec(&(&self.index, &self.versions)).context("encode snapshot")?,
+        );
         let tmp = disk.dir.join(format!("{SNAPSHOT_FILE}.tmp"));
         let mut file = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         file.write_all(&bytes)?;
@@ -297,7 +420,7 @@ impl Store {
     }
 }
 
-fn apply(index: &mut Index, op: Op) -> Result<()> {
+fn apply(index: &mut Index, versions: &mut Versions, op: Op) -> Result<()> {
     match op {
         Op::Add(docs) => index_docs(index, docs).map(|_| ()),
         Op::Delete(id) => {
@@ -305,6 +428,29 @@ fn apply(index: &mut Index, op: Op) -> Result<()> {
             Ok(())
         }
         Op::Update(doc) => index.update(doc).map(|_| ()),
+        Op::AddAt(docs, version) => {
+            for doc in docs {
+                let id = doc.id.clone();
+                if index.add(doc)? {
+                    versions.docs.insert(id.clone(), version);
+                    versions.deleted.remove(&id);
+                }
+            }
+            Ok(())
+        }
+        Op::PutAt(doc, version) => {
+            let id = doc.id.clone();
+            index.update(doc)?;
+            versions.docs.insert(id.clone(), version);
+            versions.deleted.remove(&id);
+            Ok(())
+        }
+        Op::DeleteAt(id, version) => {
+            index.delete(&id);
+            versions.docs.remove(&id);
+            versions.deleted.insert(id, version);
+            Ok(())
+        }
     }
 }
 

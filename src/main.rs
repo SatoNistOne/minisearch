@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use minisearch::coordinator::{self, DocsResponse};
+use minisearch::coordinator::{self, DocsResponse, EXTRACT_ERROR_CODE};
+use minisearch::extract::{MAX_FILE_BYTES, extract};
 use minisearch::index::read_dir;
 use minisearch::shard;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -34,12 +36,56 @@ enum Command {
         #[arg(long)]
         dir: PathBuf,
     },
+    #[command(hide = true)]
+    Extract {
+        #[arg(long)]
+        name: String,
+    },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+const EXTRACT_MEMORY: u64 = 1024 * 1024 * 1024;
+const EXTRACT_CPU_SECONDS: u64 = 60;
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Command::Extract { name } = &cli.command {
+        std::process::exit(extract_main(name));
+    }
     tracing_subscriber::fmt::init();
-    match Cli::parse().command {
+    tokio::runtime::Runtime::new()?.block_on(serve(cli.command))
+}
+
+fn extract_main(name: &str) -> i32 {
+    #[cfg(unix)]
+    {
+        rlimit::Resource::AS
+            .set(EXTRACT_MEMORY, EXTRACT_MEMORY)
+            .ok();
+        rlimit::Resource::CPU
+            .set(EXTRACT_CPU_SECONDS, EXTRACT_CPU_SECONDS)
+            .ok();
+    }
+    let mut bytes = Vec::new();
+    let limit = MAX_FILE_BYTES as u64 + 1;
+    if let Err(e) = std::io::stdin().take(limit).read_to_end(&mut bytes) {
+        eprintln!("не удалось прочитать файл: {e}");
+        return EXTRACT_ERROR_CODE;
+    }
+    let doc = match extract(name, &bytes) {
+        Ok(doc) => doc,
+        Err(e) => {
+            eprintln!("{e:#}");
+            return EXTRACT_ERROR_CODE;
+        }
+    };
+    match serde_json::to_vec(&doc) {
+        Ok(json) if std::io::stdout().write_all(&json).is_ok() => 0,
+        _ => EXTRACT_ERROR_CODE,
+    }
+}
+
+async fn serve(command: Command) -> Result<()> {
+    match command {
         Command::Shard {
             port,
             data_dir,
@@ -47,6 +93,7 @@ async fn main() -> Result<()> {
         } => shard::run(port, data_dir, snapshot_every).await,
         Command::Coordinator { port, shards } => coordinator::run(port, shards).await,
         Command::Load { coordinator, dir } => load(&coordinator, &dir).await,
+        Command::Extract { .. } => Ok(()),
     }
 }
 

@@ -6,7 +6,7 @@ use crate::extract::extract;
 use crate::index::Doc;
 use crate::query::{Segment, highlight, last_prefix, parse_query};
 use crate::shard::{
-    DocBody, DocInfo, DocList, Health, Hit, IndexResult, ListParams, SearchRequest, SearchResult,
+    stamp, DocBody, DocInfo, DocList, Health, Hit, IndexResult, ListParams, SearchRequest, SearchResult,
     Stats, StatsRequest, SuggestParams, SuggestResponse, cursor, info_key, now, order,
 };
 use crate::synonyms::synonyms;
@@ -14,7 +14,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
@@ -23,14 +23,26 @@ use axum::{Json, Router};
 use futures::future::join_all;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 use std::time::{Duration, Instant};
 use xxhash_rust::xxh3::xxh3_64;
+
+#[derive(Debug, Clone)]
+pub enum Extractor {
+    Thread,
+    Process { exe: PathBuf, timeout: Duration },
+}
 
 #[derive(Clone)]
 struct AppState {
     groups: Arc<Vec<Vec<String>>>,
     client: reqwest::Client,
+    extractor: Extractor,
+    slots: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -295,13 +307,61 @@ pub const JSON_BODY_LIMIT: usize = 64 * 1024 * 1024;
 pub const EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const FILE_TIMEOUT: Duration = Duration::from_secs(60);
 
-async fn extract_file(file: String, bytes: axum::body::Bytes) -> Result<Doc> {
-    let task = tokio::task::spawn_blocking(move || extract(&file, &bytes));
-    match tokio::time::timeout(EXTRACT_TIMEOUT, task).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => anyhow::bail!("не удалось прочитать файл"),
-        Err(_) => anyhow::bail!("файл обрабатывается слишком долго"),
+pub const EXTRACT_ERROR_CODE: i32 = 2;
+
+async fn extract_file(st: &AppState, file: String, bytes: axum::body::Bytes) -> Result<Doc> {
+    let _slot = st.slots.acquire().await?;
+    match &st.extractor {
+        Extractor::Thread => {
+            let task = tokio::task::spawn_blocking(move || extract(&file, &bytes));
+            match tokio::time::timeout(EXTRACT_TIMEOUT, task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => anyhow::bail!("не удалось прочитать файл"),
+                Err(_) => anyhow::bail!("файл обрабатывается слишком долго"),
+            }
+        }
+        Extractor::Process { exe, timeout } => extract_in_process(exe, *timeout, file, bytes).await,
     }
+}
+
+async fn extract_in_process(
+    exe: &std::path::Path,
+    timeout: Duration,
+    file: String,
+    bytes: axum::body::Bytes,
+) -> Result<Doc> {
+    let mut child = tokio::process::Command::new(exe)
+        .arg("extract")
+        .arg(format!("--name={file}"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("не удалось запустить разбор файла")?;
+    let mut stdin = child.stdin.take().context("не удалось запустить разбор файла")?;
+    let feed = tokio::spawn(async move {
+        stdin.write_all(&bytes).await.ok();
+    });
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(output) => output.context("не удалось прочитать файл")?,
+        Err(_) => anyhow::bail!("файл обрабатывается слишком долго"),
+    };
+    feed.abort();
+    if output.status.success() {
+        return serde_json::from_slice(&output.stdout).context("не удалось прочитать файл");
+    }
+    if output.status.code() == Some(EXTRACT_ERROR_CODE) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+        anyhow::bail!(if message.is_empty() {
+            "не удалось прочитать файл".to_string()
+        } else {
+            message
+        });
+    }
+    tracing::warn!(file, status = %output.status, "extractor crashed");
+    anyhow::bail!("файл повреждён или слишком сложный для разбора")
 }
 
 async fn store_file(st: &AppState, id: &str, bytes: &axum::body::Bytes) -> Vec<String> {
@@ -378,7 +438,7 @@ async fn upload_handler(
     }
     let st = &st;
     let outcomes = join_all(files.into_iter().map(|(file, bytes)| async move {
-        let mut doc = match extract_file(file.clone(), bytes.clone()).await {
+        let mut doc = match extract_file(st, file.clone(), bytes.clone()).await {
             Ok(doc) => doc,
             Err(e) => return (upload_error(file, None, format!("{e:#}")), Vec::new()),
         };
@@ -646,6 +706,7 @@ async fn index_in_groups(st: &AppState, docs: Vec<Doc>) -> DocsResponse {
         batches[shard].push(doc);
     }
     let client = &st.client;
+    let version = stamp();
     let requests = st
         .groups
         .iter()
@@ -653,7 +714,7 @@ async fn index_in_groups(st: &AppState, docs: Vec<Doc>) -> DocsResponse {
         .filter(|(_, batch)| !batch.is_empty())
         .map(|(group, batch)| async move {
             let results = join_all(group.iter().map(|addr| {
-                post_json::<_, IndexResult>(client, format!("{addr}/docs"), batch)
+                post_json::<_, IndexResult>(client, format!("{addr}/docs?version={version}"), batch)
             }))
             .await;
             first_ok(group, "docs", results)
@@ -686,8 +747,14 @@ async fn forward_write(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let group = &st.groups[shard_for(id, st.groups.len())];
     let method = &method;
+    let version = stamp();
     let results = join_all(group.iter().map(|addr| async move {
-        let mut request = st.client.request(method.clone(), doc_url(addr, id)?);
+        let mut url = doc_url(addr, id)?;
+        if doc.is_none() {
+            url.query_pairs_mut()
+                .append_pair("version", &version.to_string());
+        }
+        let mut request = st.client.request(method.clone(), url);
         if let Some(doc) = doc {
             request = request.json(doc);
         }
@@ -722,6 +789,7 @@ async fn put_handler(
     if doc.updated == 0 {
         doc.updated = now();
     }
+    doc.version = stamp();
     forward_write(&st, &id, reqwest::Method::PUT, Some(&doc)).await
 }
 
@@ -964,13 +1032,20 @@ async fn stats_handler(State(st): State<AppState>) -> Json<ClusterStats> {
 }
 
 pub fn router(groups: Vec<Vec<String>>) -> Result<Router> {
+    router_with(groups, Extractor::Thread)
+}
+
+pub fn router_with(groups: Vec<Vec<String>>, extractor: Extractor) -> Result<Router> {
     anyhow::ensure!(groups.iter().all(|g| !g.is_empty()), "empty replica group");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get());
     let state = AppState {
         groups: Arc::new(groups),
         client,
+        extractor,
+        slots: Arc::new(Semaphore::new(workers)),
     };
     Ok(Router::new()
         .route(
@@ -1001,7 +1076,17 @@ pub fn router(groups: Vec<Vec<String>>) -> Result<Router> {
 }
 
 pub async fn run(port: u16, shards: Vec<String>) -> Result<()> {
-    let app = router(parse_groups(&shards)?)?;
+    let groups = parse_groups(&shards)?;
+    let extractor = Extractor::Process {
+        exe: std::env::current_exe().context("current exe")?,
+        timeout: EXTRACT_TIMEOUT,
+    };
+    let app = router_with(groups.clone(), extractor)?;
+    tokio::spawn(async move {
+        if let Err(e) = crate::sync::run(groups).await {
+            tracing::error!(error = %e, "replica sync stopped");
+        }
+    });
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "coordinator listening");
     axum::serve(listener, app).await?;

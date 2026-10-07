@@ -8,3 +8,4 @@ pub mod scoring;
 pub mod shard;
 pub mod storage;
 pub mod synonyms;
+pub mod sync;

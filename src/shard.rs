@@ -2,7 +2,7 @@ use crate::fuzzy::{self, ExpandRequest, ExpandResponse, FUZZY_WEIGHT, Suggestion
 use crate::index::{Doc, Index, Meta};
 use crate::query::{Segment, snippet};
 use crate::scoring;
-use crate::storage::{SNAPSHOT_FILE, Store};
+use crate::storage::{Digest, SNAPSHOT_FILE, Store, SyncEntry};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -90,6 +91,42 @@ pub struct DocBody {
     pub body: String,
     #[serde(default)]
     pub updated: u64,
+    #[serde(default)]
+    pub version: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct VersionParams {
+    #[serde(default)]
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncApply {
+    pub id: String,
+    pub version: u64,
+    #[serde(default)]
+    pub doc: Option<Doc>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncResult {
+    pub applied: usize,
+    pub ignored: usize,
+}
+
+static LAST_STAMP: AtomicU64 = AtomicU64::new(0);
+
+pub fn stamp() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let prev = LAST_STAMP
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+            Some(now.max(last + 1))
+        })
+        .unwrap_or_else(|last| last);
+    now.max(prev + 1)
 }
 
 pub fn now() -> u64 {
@@ -506,16 +543,30 @@ fn internal(e: anyhow::Error) -> (StatusCode, String) {
 
 async fn docs_handler(
     State(store): State<SharedStore>,
+    Query(params): Query<VersionParams>,
     Json(docs): Json<Vec<Doc>>,
 ) -> Result<Json<IndexResult>, (StatusCode, String)> {
-    store.write().await.add(docs).map(Json).map_err(internal)
+    let mut store = store.write().await;
+    let result = if params.version > 0 {
+        store.add_at(docs, params.version)
+    } else {
+        store.add(docs)
+    };
+    result.map(Json).map_err(internal)
 }
 
 async fn delete_handler(
     State(store): State<SharedStore>,
     Path(id): Path<String>,
+    Query(params): Query<VersionParams>,
 ) -> Result<(StatusCode, Json<WriteResult>), (StatusCode, String)> {
-    if store.write().await.delete(&id).map_err(internal)? {
+    let mut store = store.write().await;
+    let deleted = if params.version > 0 {
+        store.delete_at(&id, params.version)
+    } else {
+        store.delete(&id)
+    };
+    if deleted.map_err(internal)? {
         Ok((StatusCode::OK, write_result(id, "deleted")))
     } else {
         Ok((StatusCode::NOT_FOUND, write_result(id, "not_found")))
@@ -541,18 +592,70 @@ async fn put_handler(
     if !meta.file {
         meta.size = (doc.title.len() + 1 + doc.body.len()) as u64;
     }
+    let version = doc.version;
     let doc = Doc {
         id: id.clone(),
         title: doc.title,
         body: doc.body,
         meta,
     };
-    let existed = store.update(doc).map_err(internal)?;
-    if existed {
-        Ok((StatusCode::OK, write_result(id, "updated")))
+    let existed = if version > 0 {
+        store.put_at(doc, version).map_err(internal)?
     } else {
-        Ok((StatusCode::CREATED, write_result(id, "created")))
+        Some(store.update(doc).map_err(internal)?)
+    };
+    match existed {
+        Some(true) => Ok((StatusCode::OK, write_result(id, "updated"))),
+        Some(false) => Ok((StatusCode::CREATED, write_result(id, "created"))),
+        None => Ok((StatusCode::OK, write_result(id, "ignored"))),
     }
+}
+
+async fn sync_list_handler(State(store): State<SharedStore>) -> Json<Vec<SyncEntry>> {
+    Json(store.read().await.entries())
+}
+
+async fn digest_handler(State(store): State<SharedStore>) -> Json<Digest> {
+    Json(store.read().await.digest())
+}
+
+async fn sync_fetch_handler(
+    State(store): State<SharedStore>,
+    Json(ids): Json<Vec<String>>,
+) -> Json<Vec<Doc>> {
+    let store = store.read().await;
+    Json(
+        ids.iter()
+            .filter_map(|id| get_doc(&store.index, id).cloned())
+            .collect(),
+    )
+}
+
+async fn sync_apply_handler(
+    State(store): State<SharedStore>,
+    Json(items): Json<Vec<SyncApply>>,
+) -> Result<Json<SyncResult>, (StatusCode, String)> {
+    let mut store = store.write().await;
+    let mut result = SyncResult::default();
+    for item in items {
+        let applied = match item.doc {
+            Some(mut doc) => {
+                doc.id = item.id;
+                store.put_at(doc, item.version).map_err(internal)?.is_some()
+            }
+            None => {
+                let fresh = item.version > store.version(&item.id);
+                store.delete_at(&item.id, item.version).map_err(internal)?;
+                fresh
+            }
+        };
+        if applied {
+            result.applied += 1;
+        } else {
+            result.ignored += 1;
+        }
+    }
+    Ok(Json(result))
 }
 
 async fn get_file_handler(
@@ -656,6 +759,9 @@ pub fn router(store: SharedStore) -> Router {
             get(get_handler).put(put_handler).delete(delete_handler),
         )
         .route("/files/{id}", get(get_file_handler).put(put_file_handler))
+        .route("/sync", get(sync_list_handler).post(sync_apply_handler))
+        .route("/sync/digest", get(digest_handler))
+        .route("/sync/fetch", post(sync_fetch_handler))
         .route("/stats", post(stats_handler))
         .route("/search", post(search_handler))
         .route("/snapshot", post(snapshot_handler))
