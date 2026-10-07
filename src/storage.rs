@@ -1,19 +1,76 @@
-use crate::index::{Doc, Index};
+use crate::index::{Doc, Index, Posting};
 use crate::shard::{IndexResult, index_docs};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use xxhash_rust::xxh3::xxh3_128;
 
 pub const SNAPSHOT_FILE: &str = "shard.snap";
 pub const WAL_FILE: &str = "wal.log";
+pub const FILES_DIR: &str = "files";
+pub const SNAPSHOT_MAGIC: &[u8] = b"MSNAP2\n";
+pub const WAL_MAGIC: &[u8] = b"MSWAL2\n";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Op {
     Add(Vec<Doc>),
     Delete(String),
     Update(Doc),
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyDoc {
+    id: String,
+    title: String,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+enum LegacyOp {
+    Add(Vec<LegacyDoc>),
+    Delete(String),
+    Update(LegacyDoc),
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyIndex {
+    _postings: HashMap<String, Vec<Posting>>,
+    _lengths: HashMap<u32, u32>,
+    docs: HashMap<u32, LegacyDoc>,
+    _forward: HashMap<u32, Vec<String>>,
+    _ids: HashMap<String, u32>,
+    _words: BTreeMap<String, u32>,
+    _doc_words: HashMap<u32, Vec<String>>,
+    _total_len: u64,
+    _next_doc: u32,
+}
+
+impl From<LegacyDoc> for Doc {
+    fn from(doc: LegacyDoc) -> Self {
+        Doc::new(doc.id, doc.title, doc.body)
+    }
+}
+
+impl From<LegacyOp> for Op {
+    fn from(op: LegacyOp) -> Self {
+        match op {
+            LegacyOp::Add(docs) => Op::Add(docs.into_iter().map(Doc::from).collect()),
+            LegacyOp::Delete(id) => Op::Delete(id),
+            LegacyOp::Update(doc) => Op::Update(doc.into()),
+        }
+    }
+}
+
+fn legacy_index(bytes: &[u8]) -> Result<Index> {
+    let legacy: LegacyIndex = postcard::from_bytes(bytes)?;
+    let mut docs: Vec<(u32, LegacyDoc)> = legacy.docs.into_iter().collect();
+    docs.sort_by_key(|(internal, _)| *internal);
+    let mut index = Index::new();
+    index_docs(&mut index, docs.into_iter().map(|(_, doc)| doc.into()).collect())?;
+    Ok(index)
 }
 
 #[derive(Debug)]
@@ -27,6 +84,7 @@ struct Disk {
 pub struct Store {
     pub index: Index,
     disk: Option<Disk>,
+    files: HashMap<String, Vec<u8>>,
     wal_ops: usize,
 }
 
@@ -36,18 +94,29 @@ impl Store {
     }
 
     pub fn open(dir: &Path, snapshot_every: usize) -> Result<Self> {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        std::fs::create_dir_all(dir.join(FILES_DIR))
+            .with_context(|| format!("create {}", dir.display()))?;
         let snap_path = dir.join(SNAPSHOT_FILE);
+        let mut legacy = false;
         let mut index = if snap_path.exists() {
             let bytes = std::fs::read(&snap_path)
                 .with_context(|| format!("read {}", snap_path.display()))?;
-            postcard::from_bytes(&bytes)
-                .with_context(|| format!("decode {}", snap_path.display()))?
+            match bytes.strip_prefix(SNAPSHOT_MAGIC) {
+                Some(rest) => postcard::from_bytes(rest)
+                    .with_context(|| format!("decode {}", snap_path.display()))?,
+                None => {
+                    legacy = true;
+                    tracing::warn!("migrating legacy snapshot");
+                    legacy_index(&bytes)
+                        .with_context(|| format!("decode {}", snap_path.display()))?
+                }
+            }
         } else {
             Index::new()
         };
         let wal_path = dir.join(WAL_FILE);
-        let (ops, valid) = read_wal(&wal_path)?;
+        let (ops, valid, legacy_wal) = read_wal_any(&wal_path)?;
+        legacy |= legacy_wal;
         let wal_ops = ops.len();
         for op in ops {
             if let Err(e) = apply(&mut index, op) {
@@ -71,9 +140,14 @@ impl Store {
                 wal,
                 snapshot_every,
             }),
+            files: HashMap::new(),
             wal_ops,
         };
-        store.maybe_snapshot()?;
+        if legacy {
+            store.snapshot()?;
+        } else {
+            store.maybe_snapshot()?;
+        }
         Ok(store)
     }
 
@@ -101,6 +175,7 @@ impl Store {
         }
         self.log(&Op::Delete(id.to_string()))?;
         let deleted = self.index.delete(id);
+        self.remove_file(id)?;
         self.maybe_snapshot()?;
         Ok(deleted)
     }
@@ -116,11 +191,71 @@ impl Store {
         existed
     }
 
+    fn file_path(&self, id: &str) -> Option<PathBuf> {
+        let disk = self.disk.as_ref()?;
+        Some(
+            disk.dir
+                .join(FILES_DIR)
+                .join(format!("{:032x}", xxh3_128(id.as_bytes()))),
+        )
+    }
+
+    pub fn put_file(&mut self, id: &str, bytes: Vec<u8>) -> Result<bool> {
+        if !self.index.contains(id) {
+            return Ok(false);
+        }
+        match self.file_path(id) {
+            Some(path) => {
+                let tmp = path.with_extension("tmp");
+                let mut file =
+                    File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                drop(file);
+                std::fs::rename(&tmp, &path).context("rename file")?;
+            }
+            None => {
+                self.files.insert(id.to_string(), bytes);
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn get_file(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        if !self.index.contains(id) {
+            return Ok(None);
+        }
+        match self.file_path(id) {
+            Some(path) => match std::fs::read(&path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+            },
+            None => Ok(self.files.get(id).cloned()),
+        }
+    }
+
+    fn remove_file(&mut self, id: &str) -> Result<()> {
+        match self.file_path(id) {
+            Some(path) => match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(e).with_context(|| format!("remove {}", path.display()))
+                }
+                _ => Ok(()),
+            },
+            None => {
+                self.files.remove(id);
+                Ok(())
+            }
+        }
+    }
+
     pub fn snapshot(&mut self) -> Result<()> {
         let Some(disk) = &self.disk else {
             bail!("shard has no data dir");
         };
-        let bytes = postcard::to_allocvec(&self.index).context("encode snapshot")?;
+        let mut bytes = SNAPSHOT_MAGIC.to_vec();
+        bytes.extend(postcard::to_allocvec(&self.index).context("encode snapshot")?);
         let tmp = disk.dir.join(format!("{SNAPSHOT_FILE}.tmp"));
         let mut file = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         file.write_all(&bytes)?;
@@ -142,7 +277,10 @@ impl Store {
         };
         let payload = postcard::to_allocvec(op).context("encode wal record")?;
         let len = u32::try_from(payload.len()).context("wal record is too large")?;
-        let mut record = Vec::with_capacity(payload.len() + 4);
+        let mut record = Vec::with_capacity(payload.len() + WAL_MAGIC.len() + 4);
+        if disk.wal.metadata()?.len() == 0 {
+            record.extend_from_slice(WAL_MAGIC);
+        }
         record.extend_from_slice(&len.to_le_bytes());
         record.extend_from_slice(&payload);
         disk.wal.write_all(&record).context("write wal")?;
@@ -170,20 +308,15 @@ fn apply(index: &mut Index, op: Op) -> Result<()> {
     }
 }
 
-pub fn read_wal(path: &Path) -> Result<(Vec<Op>, u64)> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
+fn read_records<T: serde::de::DeserializeOwned>(bytes: &[u8], start: usize) -> (Vec<T>, u64) {
     let mut ops = Vec::new();
-    let mut offset = 0usize;
+    let mut offset = start;
     while let Some(header) = bytes.get(offset..offset + 4) {
         let mut len = [0u8; 4];
         len.copy_from_slice(header);
-        let start = offset + 4;
-        let end = start + u32::from_le_bytes(len) as usize;
-        let Some(payload) = bytes.get(start..end) else {
+        let begin = offset + 4;
+        let end = begin + u32::from_le_bytes(len) as usize;
+        let Some(payload) = bytes.get(begin..end) else {
             break;
         };
         let Ok(op) = postcard::from_bytes(payload) else {
@@ -192,5 +325,28 @@ pub fn read_wal(path: &Path) -> Result<(Vec<Op>, u64)> {
         ops.push(op);
         offset = end;
     }
-    Ok((ops, offset as u64))
+    (ops, offset as u64)
+}
+
+fn read_wal_any(path: &Path) -> Result<(Vec<Op>, u64, bool)> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0, false)),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    if bytes.is_empty() {
+        return Ok((Vec::new(), 0, false));
+    }
+    if bytes.starts_with(WAL_MAGIC) {
+        let (ops, valid) = read_records(&bytes, WAL_MAGIC.len());
+        return Ok((ops, valid, false));
+    }
+    tracing::warn!("migrating legacy wal");
+    let (ops, valid) = read_records::<LegacyOp>(&bytes, 0);
+    Ok((ops.into_iter().map(Op::from).collect(), valid, true))
+}
+
+pub fn read_wal(path: &Path) -> Result<(Vec<Op>, u64)> {
+    let (ops, valid, _) = read_wal_any(path)?;
+    Ok((ops, valid))
 }

@@ -4,11 +4,38 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Meta {
+    #[serde(default)]
+    pub format: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub created: u64,
+    #[serde(default)]
+    pub updated: u64,
+    #[serde(default)]
+    pub file: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Doc {
     pub id: String,
     pub title: String,
     pub body: String,
+    #[serde(default)]
+    pub meta: Meta,
+}
+
+impl Doc {
+    pub fn new(id: impl Into<String>, title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            body: body.into(),
+            meta: Meta::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -167,9 +194,8 @@ fn parse_file(path: &Path) -> Result<Doc> {
         .to_string();
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let (title, body) = text.split_once('\n').unwrap_or((text.as_str(), ""));
-    Ok(Doc {
-        id,
-        title: title.trim().to_string(),
-        body: body.trim().to_string(),
-    })
+    let mut doc = Doc::new(id, title.trim(), body.trim());
+    doc.meta.format = "txt".to_string();
+    doc.meta.size = text.len() as u64;
+    Ok(doc)
 }

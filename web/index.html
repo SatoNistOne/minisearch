@@ -92,6 +92,7 @@ button.link {
 }
 button.link:hover { color: var(--accent); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+[hidden] { display: none !important; }
 .top {
   position: sticky;
   top: 0;
@@ -210,6 +211,35 @@ dialog.viewer::backdrop { background: rgba(0, 0, 0, 0.4); }
 .viewer-meta .spacer { flex: 1; }
 button.danger { color: var(--err); border-color: var(--err); background: transparent; }
 .viewer-body { flex: 1; overflow-y: auto; padding: 16px 20px 28px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.viewer-body mark.current { outline: 2px solid var(--accent); }
+.viewer-info { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 8px 20px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+.viewer-info:empty { display: none; }
+.viewer-status { margin: 0; padding: 8px 20px; border-bottom: 1px solid var(--border); color: var(--err); font-size: 13px; }
+.viewer-status:empty { display: none; }
+.docs-status { margin: 0 0 8px; }
+.layout > .card { scroll-margin-top: 80px; }
+.docs-status:empty { display: none; }
+.matches { display: flex; align-items: center; gap: 4px; }
+.matches button { padding: 2px 8px; }
+a.button { display: inline-block; text-decoration: none; color: inherit; border: 1px solid var(--border); border-radius: 8px; padding: 7px 11px; }
+a.button:hover { background: var(--hover); }
+.editor { flex: 1; display: flex; flex-direction: column; gap: 10px; padding: 16px 20px; min-height: 0; }
+.editor input { width: 100%; }
+.editor textarea {
+  flex: 1;
+  min-height: 200px;
+  width: 100%;
+  resize: none;
+  font: inherit;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.editor-actions { display: flex; gap: 8px; align-items: center; }
+.list-controls { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.list-controls select { flex: 1 1 120px; padding: 5px 8px; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -235,7 +265,7 @@ button.danger { color: var(--err); border-color: var(--err); background: transpa
       <label class="check"><input type="checkbox" id="fuzzy"> с опечатками</label>
       <button type="submit" class="primary">Найти</button>
     </form>
-    <p class="hint">Фразы берите в кавычки: <code>"хлеб на закваске"</code>. «С опечатками» находит слова, написанные с ошибкой.</p>
+    <p class="hint">Поиск идёт во время набора. Фразы берите в кавычки: <code>"хлеб на закваске"</code> или <code>«хлеб на закваске»</code>. «С опечатками» находит слова, написанные с ошибкой; близкие по смыслу слова (батон → хлеб) ищутся сами.</p>
   </section>
   <div class="layout">
     <section class="card" aria-live="polite">
@@ -255,16 +285,32 @@ button.danger { color: var(--err); border-color: var(--err); background: transpa
         <label class="dropzone" id="dropzone" for="files">
           <strong>Перетащите файлы сюда</strong>
           <span>или нажмите, чтобы выбрать</span>
-          <span class="muted">.txt (UTF-8) и .docx, до 10 МБ</span>
+          <span class="muted">.txt (UTF-8), .docx и .pdf, до 10 МБ</span>
         </label>
-        <input type="file" id="files" class="visually-hidden" multiple accept=".txt,.docx">
+        <input type="file" id="files" class="visually-hidden" multiple accept=".txt,.docx,.pdf">
         <ul class="plain upload-results" id="upload-results"></ul>
       </section>
       <section class="card">
         <h2>Документы <span class="muted" id="docs-total"></span></h2>
+        <div class="list-controls">
+          <select id="sort" aria-label="Сортировка">
+            <option value="id">по имени</option>
+            <option value="title">по заголовку</option>
+            <option value="created-desc">сначала новые</option>
+            <option value="created">сначала старые</option>
+            <option value="size-desc">сначала большие</option>
+            <option value="size">сначала маленькие</option>
+          </select>
+          <select id="format" aria-label="Тип файла">
+            <option value="">все типы</option>
+            <option value="txt">.txt</option>
+            <option value="docx">.docx</option>
+            <option value="pdf">.pdf</option>
+          </select>
+        </div>
+        <p class="status docs-status" id="docs-status"></p>
         <ul class="plain doc-list" id="doc-list"></ul>
         <button type="button" class="ghost more" id="more" hidden>Показать ещё</button>
-        <p class="status" id="docs-status"></p>
       </section>
     </aside>
   </div>
@@ -276,21 +322,50 @@ button.danger { color: var(--err); border-color: var(--err); background: transpa
       <button type="button" class="ghost" id="viewer-close" aria-label="Закрыть">✕</button>
     </div>
     <div class="viewer-meta">
-      <span class="muted" id="viewer-id"></span>
-      <span class="muted" id="viewer-words"></span>
+      <span class="matches" id="matches" hidden>
+        <span class="muted" id="matches-count"></span>
+        <button type="button" class="ghost" id="match-prev" aria-label="Предыдущее совпадение">↑</button>
+        <button type="button" class="ghost" id="match-next" aria-label="Следующее совпадение">↓</button>
+      </span>
       <span class="spacer"></span>
+      <a class="button" id="viewer-download" href="#" download>Скачать</a>
+      <button type="button" class="ghost" id="viewer-edit">Изменить</button>
       <button type="button" class="danger" id="viewer-delete">Удалить</button>
     </div>
+    <div class="viewer-info" id="viewer-info"></div>
+    <p class="viewer-status" id="viewer-status"></p>
     <div class="viewer-body" id="viewer-body"></div>
+    <form class="editor" id="editor" hidden>
+      <input type="text" id="edit-title" aria-label="Заголовок" placeholder="Заголовок">
+      <textarea id="edit-body" aria-label="Текст"></textarea>
+      <div class="editor-actions">
+        <button type="submit" class="primary" id="edit-save">Сохранить</button>
+        <button type="button" class="ghost" id="edit-cancel">Отмена</button>
+        <span class="muted" id="edit-status"></span>
+      </div>
+    </form>
   </div>
 </dialog>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
-const state = { q: "", operator: "or", fuzzy: false, from: 0, size: 10, doc: "" };
+const state = { q: "", operator: "or", fuzzy: false, from: 0, size: 10, doc: "", terms: [] };
 const MAX_FILE = 10 * 1024 * 1024;
 const MAX_BATCH = 20;
-const EXTENSIONS = ["txt", "docx"];
+const EXTENSIONS = ["txt", "docx", "pdf"];
+const FORMATS = { txt: "текст", docx: "Word", pdf: "PDF" };
+
+function formatSize(bytes) {
+  if (!bytes) return "";
+  if (bytes < 1024) return bytes + " Б";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1).replace(".0", "") + " КБ";
+  return (bytes / 1024 / 1024).toFixed(1).replace(".0", "") + " МБ";
+}
+
+function formatDate(secs) {
+  if (!secs) return "";
+  return new Date(secs * 1000).toLocaleString("ru-RU", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+}
 
 function el(tag, text, cls) {
   const node = document.createElement(tag);
@@ -432,22 +507,30 @@ function renderError(message) {
   showWarning(message);
 }
 
+let searchSeq = 0;
+
 async function runSearch() {
+  const seq = ++searchSeq;
   if (!state.q.trim()) {
+    state.terms = [];
     clearResults();
     return;
   }
-  const p = new URLSearchParams({ q: state.q, operator: state.operator, from: state.from, size: state.size });
+  const p = new URLSearchParams({ q: state.q, operator: state.operator, from: state.from, size: state.size, prefix: "true" });
   if (state.fuzzy) p.set("fuzzy", "true");
   try {
     const resp = await fetch("/search?" + p.toString());
+    if (seq !== searchSeq) return;
     if (!resp.ok) {
       renderError("Ошибка поиска: " + await errorText(resp));
       return;
     }
-    renderResults(await resp.json());
+    const data = await resp.json();
+    if (seq !== searchSeq) return;
+    state.terms = data.terms || [];
+    renderResults(data);
   } catch (e) {
-    renderError("Сервер недоступен: " + e.message);
+    if (seq === searchSeq) renderError("Сервер недоступен: " + e.message);
   }
 }
 
@@ -458,6 +541,7 @@ function search(push) {
 
 $("search-form").addEventListener("submit", (e) => {
   e.preventDefault();
+  clearTimeout(liveTimer);
   hideSuggest();
   state.q = $("q").value;
   state.operator = $("operator").value;
@@ -478,11 +562,18 @@ $("fuzzy").addEventListener("change", () => {
 $("prev").addEventListener("click", () => {
   state.from = Math.max(0, state.from - state.size);
   search(true);
+  toResults();
 });
 $("next").addEventListener("click", () => {
   state.from += state.size;
   search(true);
+  toResults();
 });
+
+function toResults() {
+  const card = $("meta").closest("section");
+  if (card.getBoundingClientRect().top < 0) card.scrollIntoView({ block: "start" });
+}
 
 const suggest = { timer: 0, seq: 0, items: [], active: -1 };
 const LAST_WORD = /[\p{L}\p{N}_]+$/u;
@@ -509,6 +600,10 @@ function applySuggest(word) {
   input.value = input.value.replace(LAST_WORD, word) + " ";
   hideSuggest();
   input.focus();
+  clearTimeout(liveTimer);
+  state.q = input.value;
+  state.from = 0;
+  search(false);
 }
 
 function renderSuggest(items) {
@@ -542,7 +637,15 @@ async function loadSuggest(prefix, seq) {
   }
 }
 
+let liveTimer = 0;
 $("q").addEventListener("input", () => {
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => {
+    if ($("q").value === state.q) return;
+    state.q = $("q").value;
+    state.from = 0;
+    search(false);
+  }, 300);
   const match = $("q").value.match(LAST_WORD);
   const prefix = match ? match[0] : "";
   hideSuggest();
@@ -553,6 +656,7 @@ $("q").addEventListener("input", () => {
 $("q").addEventListener("keydown", (e) => {
   const n = suggest.items.length;
   if (e.key === "Escape") {
+    if (!$("suggest").hidden) e.preventDefault();
     hideSuggest();
     return;
   }
@@ -580,7 +684,9 @@ function docRow(doc) {
   title.title = doc.title || doc.id;
   title.addEventListener("click", () => openDoc(doc.id));
   main.appendChild(title);
-  main.appendChild(el("div", doc.id + " · " + doc.words + " " + plural(doc.words, "слово", "слова", "слов"), "doc-sub"));
+  const sub = [doc.id, FORMATS[doc.format] || "", formatSize(doc.size), formatDate(doc.created)].filter(Boolean).join(" · ");
+  main.appendChild(el("div", sub, "doc-sub"));
+  main.title = doc.words + " " + plural(doc.words, "слово", "слова", "слов");
   li.appendChild(main);
   const del = el("button", "✕", "icon");
   del.type = "button";
@@ -594,7 +700,9 @@ function docRow(doc) {
 async function loadDocs(reset) {
   if (docs.loading) return;
   docs.loading = true;
-  const p = new URLSearchParams({ size: "50" });
+  const [sort, dir] = $("sort").value.split("-");
+  const p = new URLSearchParams({ size: "50", sort, desc: dir === "desc" ? "true" : "false" });
+  if ($("format").value) p.set("format", $("format").value);
   if (!reset && docs.next) p.set("after", docs.next);
   try {
     const resp = await fetch("/docs?" + p.toString());
@@ -606,9 +714,10 @@ async function loadDocs(reset) {
     $("more").hidden = !data.next;
     const count = data.total + " " + plural(data.total, "документ", "документа", "документов");
     $("docs-total").textContent = "· " + data.total;
-    $("doc-count").textContent = count;
+    const filtered = Boolean($("format").value);
+    if (!filtered) $("doc-count").textContent = count;
     $("docs-status").textContent = data.total === 0
-      ? "Пока пусто. Загрузите первый файл."
+      ? (filtered ? "Файлов такого типа нет." : "Пока пусто. Загрузите первый файл.")
       : (data.failed_shards || []).length ? "Часть документов временно недоступна." : "";
   } catch (e) {
     $("docs-status").textContent = "Не удалось загрузить список: " + e.message;
@@ -618,44 +727,118 @@ async function loadDocs(reset) {
 }
 
 $("more").addEventListener("click", () => loadDocs(false));
+const savedSort = storeGet("sort");
+if (savedSort && [...$("sort").options].some((o) => o.value === savedSort)) $("sort").value = savedSort;
+$("sort").addEventListener("change", () => {
+  storeSet("sort", $("sort").value);
+  loadDocs(true);
+});
+$("format").addEventListener("change", () => loadDocs(true));
 
 function refreshAll() {
   loadDocs(true);
   if (state.q) runSearch();
 }
 
-async function deleteDoc(id, title) {
+async function deleteDoc(id, title, status = $("docs-status")) {
   if (!confirm("Удалить «" + (title || id) + "»?")) return false;
   try {
     const resp = await fetch("/docs/" + encodeURIComponent(id), { method: "DELETE" });
     if (!resp.ok && resp.status !== 404) {
-      $("docs-status").textContent = "Не удалось удалить " + id + ": " + await errorText(resp);
+      status.textContent = "Не удалось удалить " + id + ": " + await errorText(resp);
       return false;
     }
     $("docs-status").textContent = "Удалён: " + id;
     refreshAll();
     return true;
   } catch (e) {
-    $("docs-status").textContent = "Ошибка: " + e.message;
+    status.textContent = "Ошибка: " + e.message;
     return false;
   }
 }
 
 const viewer = $("viewer");
 let viewerDoc = null;
+const found = { marks: [], current: -1 };
+
+function setEditing(on) {
+  $("editor").hidden = !on;
+  $("viewer-body").hidden = on;
+  $("viewer-edit").disabled = on || !viewerDoc;
+  $("edit-status").textContent = "";
+  if (on && viewerDoc) {
+    $("edit-title").value = viewerDoc.title;
+    $("edit-body").value = viewerDoc.body;
+    $("edit-body").focus();
+  }
+}
+
+function showMatch(i) {
+  const n = found.marks.length;
+  if (!n) return;
+  if (found.current >= 0) found.marks[found.current].classList.remove("current");
+  found.current = (i + n) % n;
+  const mark = found.marks[found.current];
+  mark.classList.add("current");
+  mark.scrollIntoView({ block: "center" });
+  $("matches-count").textContent = (found.current + 1) + " из " + n;
+}
+
+function renderInfo(doc) {
+  const meta = doc.meta || {};
+  const words = (doc.body.match(/[\p{L}\p{N}]+/gu) || []).length;
+  const parts = [
+    doc.id,
+    FORMATS[meta.format] || "",
+    formatSize(meta.size),
+    words + " " + plural(words, "слово", "слова", "слов"),
+    meta.created ? "загружен " + formatDate(meta.created) : "",
+    meta.updated ? "изменён " + formatDate(meta.updated) : "",
+  ];
+  $("viewer-info").replaceChildren(...parts.filter(Boolean).map((t) => el("span", t)));
+}
+
+function renderBody(doc) {
+  const body = $("viewer-body");
+  body.replaceChildren();
+  found.marks = [];
+  found.current = -1;
+  if (doc.highlight) {
+    for (const seg of doc.highlight) {
+      if (seg.hl) {
+        const mark = el("mark", seg.text);
+        found.marks.push(mark);
+        body.appendChild(mark);
+      } else {
+        body.appendChild(document.createTextNode(seg.text));
+      }
+    }
+  } else {
+    body.textContent = doc.body;
+  }
+  $("matches").hidden = found.marks.length === 0;
+  body.scrollTop = 0;
+  if (found.marks.length) requestAnimationFrame(() => showMatch(0));
+}
 
 async function openDoc(id) {
   state.doc = id;
   writeUrl(false);
   viewerDoc = null;
+  setEditing(false);
   $("viewer-title").textContent = "Загрузка…";
-  $("viewer-id").textContent = id;
-  $("viewer-words").textContent = "";
+  $("viewer-info").replaceChildren();
+  $("viewer-status").textContent = "";
   $("viewer-body").textContent = "";
+  $("matches").hidden = true;
   $("viewer-delete").disabled = true;
+  $("viewer-edit").disabled = true;
+  $("viewer-download").href = "/docs/" + encodeURIComponent(id) + "/file";
   if (!viewer.open) viewer.showModal();
+  const p = new URLSearchParams();
+  if (state.q.trim() && state.terms.length) p.set("hl", state.terms.join(" "));
   try {
-    const resp = await fetch("/docs/" + encodeURIComponent(id));
+    const resp = await fetch("/docs/" + encodeURIComponent(id) + (p.toString() ? "?" + p.toString() : ""));
     if (state.doc !== id) return;
     if (!resp.ok) {
       $("viewer-title").textContent = resp.status === 404 ? "Документ не найден" : "Ошибка";
@@ -665,26 +848,68 @@ async function openDoc(id) {
     const doc = await resp.json();
     viewerDoc = doc;
     $("viewer-title").textContent = doc.title || doc.id;
-    const words = (doc.body.match(/[\p{L}\p{N}]+/gu) || []).length;
-    $("viewer-words").textContent = words + " " + plural(words, "слово", "слова", "слов");
-    $("viewer-body").textContent = doc.body;
+    renderInfo(doc);
+    renderBody(doc);
     $("viewer-delete").disabled = false;
+    $("viewer-edit").disabled = false;
   } catch (e) {
     $("viewer-title").textContent = "Ошибка";
     $("viewer-body").textContent = "Сервер недоступен: " + e.message;
   }
 }
 
+$("match-prev").addEventListener("click", () => showMatch(found.current - 1));
+$("match-next").addEventListener("click", () => showMatch(found.current + 1));
+$("viewer-edit").addEventListener("click", () => setEditing(true));
+$("edit-cancel").addEventListener("click", () => setEditing(false));
+$("editor").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!viewerDoc) return;
+  const id = viewerDoc.id;
+  const title = $("edit-title").value.trim();
+  const body = $("edit-body").value;
+  if (!title && !body.trim()) {
+    $("edit-status").textContent = "Документ не может быть пустым";
+    return;
+  }
+  $("edit-save").disabled = true;
+  $("edit-status").textContent = "Сохранение…";
+  try {
+    const resp = await fetch("/docs/" + encodeURIComponent(id), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, body }),
+    });
+    if (!resp.ok) {
+      $("edit-status").textContent = "Не удалось сохранить: " + await errorText(resp);
+      return;
+    }
+    $("docs-status").textContent = "Сохранён: " + id;
+    refreshAll();
+    await openDoc(id);
+  } catch (err) {
+    $("edit-status").textContent = "Сервер недоступен: " + err.message;
+  } finally {
+    $("edit-save").disabled = false;
+  }
+});
+
 $("viewer-close").addEventListener("click", () => viewer.close());
 viewer.addEventListener("click", (e) => {
   if (e.target === viewer) viewer.close();
+});
+viewer.addEventListener("cancel", (e) => {
+  if (!$("editor").hidden) {
+    e.preventDefault();
+    setEditing(false);
+  }
 });
 viewer.addEventListener("close", () => {
   state.doc = "";
   writeUrl(false);
 });
 $("viewer-delete").addEventListener("click", async () => {
-  if (viewerDoc && await deleteDoc(viewerDoc.id, viewerDoc.title)) viewer.close();
+  if (viewerDoc && await deleteDoc(viewerDoc.id, viewerDoc.title, $("viewer-status"))) viewer.close();
 });
 
 function uploadLine(text, cls) {
@@ -697,7 +922,7 @@ async function uploadFiles(fileList) {
   const valid = [];
   for (const file of files) {
     const ext = file.name.includes(".") ? file.name.split(".").pop().toLowerCase() : "";
-    if (!EXTENSIONS.includes(ext)) uploadLine("✕ " + file.name + ": нужен .txt или .docx", "error");
+    if (!EXTENSIONS.includes(ext)) uploadLine("✕ " + file.name + ": нужен .txt, .docx или .pdf", "error");
     else if (file.size > MAX_FILE) uploadLine("✕ " + file.name + ": больше 10 МБ", "error");
     else valid.push(file);
   }
@@ -747,14 +972,16 @@ window.addEventListener("drop", (e) => e.preventDefault());
 
 window.addEventListener("popstate", () => {
   readUrl();
-  runSearch();
-  if (state.doc) openDoc(state.doc); else if (viewer.open) viewer.close();
+  runSearch().then(() => {
+    if (state.doc) openDoc(state.doc); else if (viewer.open) viewer.close();
+  });
 });
 
 readUrl();
-runSearch();
 loadDocs(true);
-if (state.doc) openDoc(state.doc);
+runSearch().then(() => {
+  if (state.doc) openDoc(state.doc);
+});
 </script>
 </body>
 </html>

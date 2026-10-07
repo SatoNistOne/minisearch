@@ -1,4 +1,4 @@
-use crate::analyzer::normalize;
+use crate::analyzer::{normalize, stem};
 use crate::index::Index;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub const FUZZY_WEIGHT: f64 = 0.5;
 pub const SUGGEST_LIMIT: usize = 10;
 pub const MIN_PREFIX: usize = 2;
+pub const COMPLETE_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Suggestion {
@@ -16,11 +17,15 @@ pub struct Suggestion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpandRequest {
     pub terms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExpandResponse {
     pub expansions: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub completions: Vec<String>,
 }
 
 pub fn levenshtein(a: &str, b: &str) -> usize {
@@ -66,7 +71,30 @@ pub fn expand(index: &Index, terms: &[String]) -> ExpandResponse {
         found.sort();
         expansions.insert(term.clone(), found);
     }
-    ExpandResponse { expansions }
+    ExpandResponse {
+        expansions,
+        completions: Vec::new(),
+    }
+}
+
+pub fn complete(index: &Index, prefix: &str) -> Vec<String> {
+    let prefix = normalize(prefix.trim());
+    if prefix.chars().count() < MIN_PREFIX {
+        return Vec::new();
+    }
+    let mut words: Vec<(&String, u32)> = index
+        .words
+        .range(prefix.clone()..)
+        .take_while(|(word, _)| word.starts_with(&prefix))
+        .map(|(word, &count)| (word, count))
+        .collect();
+    words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let terms: BTreeSet<String> = words
+        .into_iter()
+        .take(COMPLETE_LIMIT)
+        .map(|(word, _)| stem(word.clone()))
+        .collect();
+    terms.into_iter().collect()
 }
 
 pub fn merge_expansions(

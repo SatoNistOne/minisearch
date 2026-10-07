@@ -4,12 +4,15 @@ use crate::fuzzy::{
 use crate::analyzer::analyze;
 use crate::extract::extract;
 use crate::index::Doc;
-use crate::query::{Segment, parse_query};
+use crate::query::{Segment, highlight, last_prefix, parse_query};
 use crate::shard::{
     DocBody, DocInfo, DocList, Health, Hit, IndexResult, ListParams, SearchRequest, SearchResult,
-    Stats, StatsRequest, SuggestParams, SuggestResponse,
+    Stats, StatsRequest, SuggestParams, SuggestResponse, cursor, info_key, now, order,
 };
-use std::collections::HashMap;
+use crate::synonyms::synonyms;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use anyhow::Result;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
@@ -47,6 +50,8 @@ pub struct SearchResponse {
     pub size: usize,
     pub failed_shards: Vec<String>,
     pub hits: Vec<ShardHit>,
+    #[serde(default)]
+    pub terms: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -67,6 +72,16 @@ struct SearchParams {
     operator: Option<String>,
     #[serde(default)]
     fuzzy: bool,
+    #[serde(default = "yes")]
+    proximity: bool,
+    #[serde(default = "yes")]
+    synonyms: bool,
+    #[serde(default)]
+    prefix: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,10 +138,24 @@ pub fn search_request(terms: Vec<String>, k: usize, stats: &Stats) -> SearchRequ
         phrases: Vec::new(),
         all: false,
         variants: HashMap::new(),
+        proximity: false,
         k,
         n: stats.n,
         avgdl,
         df: stats.df.clone(),
+    }
+}
+
+pub fn add_variants(
+    variants: &mut HashMap<String, Vec<String>>,
+    terms: &[String],
+    term: &str,
+    extra: impl IntoIterator<Item = String>,
+) {
+    let mut set: BTreeSet<String> = variants.remove(term).unwrap_or_default().into_iter().collect();
+    set.extend(extra.into_iter().filter(|v| !terms.contains(v)));
+    if !set.is_empty() {
+        variants.insert(term.to_string(), set.into_iter().collect());
     }
 }
 
@@ -237,8 +266,20 @@ fn first_ok<T>(group: &[String], what: &str, results: Vec<Result<T>>) -> (Option
 
 async fn docs_handler(
     State(st): State<AppState>,
-    Json(docs): Json<Vec<Doc>>,
+    Json(mut docs): Json<Vec<Doc>>,
 ) -> (StatusCode, Json<DocsResponse>) {
+    let created = now();
+    for doc in &mut docs {
+        if doc.meta.created == 0 {
+            doc.meta.created = created;
+        }
+        if doc.meta.format.is_empty() {
+            doc.meta.format = "txt".to_string();
+        }
+        if doc.meta.size == 0 {
+            doc.meta.size = (doc.title.len() + 1 + doc.body.len()) as u64;
+        }
+    }
     let response = index_in_groups(&st, docs).await;
     let status = if response.failed_shards.is_empty() {
         StatusCode::OK
@@ -250,6 +291,39 @@ async fn docs_handler(
 
 pub const MAX_UPLOAD_FILES: usize = 20;
 pub const UPLOAD_BODY_LIMIT: usize = 50 * 1024 * 1024;
+pub const JSON_BODY_LIMIT: usize = 64 * 1024 * 1024;
+pub const EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const FILE_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn extract_file(file: String, bytes: axum::body::Bytes) -> Result<Doc> {
+    let task = tokio::task::spawn_blocking(move || extract(&file, &bytes));
+    match tokio::time::timeout(EXTRACT_TIMEOUT, task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => anyhow::bail!("не удалось прочитать файл"),
+        Err(_) => anyhow::bail!("файл обрабатывается слишком долго"),
+    }
+}
+
+async fn store_file(st: &AppState, id: &str, bytes: &axum::body::Bytes) -> Vec<String> {
+    let group = &st.groups[shard_for(id, st.groups.len())];
+    let results = join_all(group.iter().map(|addr| async move {
+        let mut url = reqwest::Url::parse(addr)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("bad shard address {addr}"))?
+            .pop_if_empty()
+            .extend(["files", id]);
+        st.client
+            .put(url)
+            .timeout(FILE_TIMEOUT)
+            .body(bytes.clone())
+            .send()
+            .await?
+            .error_for_status()?;
+        anyhow::Ok(())
+    }))
+    .await;
+    first_ok(group, "file", results).1
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UploadResult {
@@ -304,12 +378,17 @@ async fn upload_handler(
     }
     let st = &st;
     let outcomes = join_all(files.into_iter().map(|(file, bytes)| async move {
-        let doc = match extract(&file, &bytes) {
+        let mut doc = match extract_file(file.clone(), bytes.clone()).await {
             Ok(doc) => doc,
             Err(e) => return (upload_error(file, None, format!("{e:#}")), Vec::new()),
         };
+        doc.meta.created = now();
+        doc.meta.file = true;
         let id = doc.id.clone();
-        let response = index_in_groups(st, vec![doc]).await;
+        let mut response = index_in_groups(st, vec![doc]).await;
+        if response.indexed > 0 {
+            response.failed_shards.extend(store_file(st, &id, &bytes).await);
+        }
         let result = if response.indexed > 0 {
             UploadResult {
                 file,
@@ -351,16 +430,14 @@ pub struct DocListResponse {
     pub failed_shards: Vec<String>,
 }
 
-async fn get_list(
-    client: &reqwest::Client,
-    addr: &str,
-    after: &str,
-    size: usize,
-) -> Result<DocList> {
+async fn get_list(client: &reqwest::Client, addr: &str, params: &ListParams) -> Result<DocList> {
     let mut url = reqwest::Url::parse(&format!("{addr}/docs"))?;
     url.query_pairs_mut()
-        .append_pair("after", after)
-        .append_pair("size", &size.to_string());
+        .append_pair("after", &params.after)
+        .append_pair("size", &params.size().to_string())
+        .append_pair("sort", params.sort.as_str())
+        .append_pair("desc", if params.desc { "true" } else { "false" })
+        .append_pair("format", &params.format);
     Ok(client
         .get(url)
         .send()
@@ -370,18 +447,25 @@ async fn get_list(
         .await?)
 }
 
-pub fn merge_lists(parts: Vec<DocList>, size: usize) -> (u64, Vec<DocInfo>, Option<String>) {
+pub fn merge_lists(parts: Vec<DocList>, params: &ListParams) -> (u64, Vec<DocInfo>, Option<String>) {
+    let size = params.size();
     let total = parts.iter().map(|p| p.total).sum();
     let mut more = parts.iter().any(|p| p.more);
     let mut docs: Vec<DocInfo> = parts.into_iter().flat_map(|p| p.docs).collect();
-    docs.sort_by(|a, b| a.id.cmp(&b.id));
+    docs.sort_by(|a, b| {
+        order(
+            params.desc,
+            &info_key(params.sort, a),
+            &info_key(params.sort, b),
+        )
+    });
     docs.dedup_by(|a, b| a.id == b.id);
     if docs.len() > size {
         docs.truncate(size);
         more = true;
     }
     let next = if more {
-        docs.last().map(|d| d.id.clone())
+        docs.last().map(|d| cursor(params.sort, d))
     } else {
         None
     };
@@ -392,12 +476,11 @@ async fn list_handler(
     State(st): State<AppState>,
     Query(params): Query<ListParams>,
 ) -> Json<DocListResponse> {
-    let size = params.size();
-    let after = params.after.as_str();
     let client = &st.client;
+    let params = &params;
     let results = join_all(st.groups.iter().map(|group| {
         read_any(group, "list", move |s| async move {
-            get_list(client, &s, after, size).await
+            get_list(client, &s, params).await
         })
     }))
     .await;
@@ -409,7 +492,7 @@ async fn list_handler(
             None => mark_failed(&mut failed, group),
         }
     }
-    let (total, docs, next) = merge_lists(parts, size);
+    let (total, docs, next) = merge_lists(parts, params);
     Json(DocListResponse {
         total,
         docs,
@@ -426,20 +509,41 @@ async fn get_doc(client: &reqwest::Client, addr: &str, id: &str) -> Result<Optio
     Ok(Some(resp.error_for_status()?.json().await?))
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct GetParams {
+    #[serde(default)]
+    pub hl: String,
+}
+
+pub fn doc_with_highlight(doc: &Doc, hl: &str) -> serde_json::Value {
+    let mut value = serde_json::json!(doc);
+    let terms: HashSet<&str> = hl.split_whitespace().collect();
+    if !terms.is_empty() {
+        let segments = highlight(&doc.body, &terms);
+        let matches = segments.iter().filter(|s| s.hl).count();
+        value["highlight"] = serde_json::json!(segments);
+        value["matches"] = serde_json::json!(matches);
+    }
+    value
+}
+
+async fn find_doc(st: &AppState, id: &str) -> Option<Option<Doc>> {
+    let group = &st.groups[shard_for(id, st.groups.len())];
+    let client = &st.client;
+    read_any(group, "get", move |s| async move { get_doc(client, &s, id).await })
+        .await
+        .map(|(_, doc)| doc)
+}
+
 async fn get_handler(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<GetParams>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let group = &st.groups[shard_for(&id, st.groups.len())];
-    let client = &st.client;
-    let id_ref = id.as_str();
-    let found = read_any(group, "get", move |s| async move {
-        get_doc(client, &s, id_ref).await
-    })
-    .await;
-    match found {
-        Some((_, Some(doc))) => (StatusCode::OK, Json(serde_json::json!(doc))),
-        Some((_, None)) => (
+    match find_doc(&st, &id).await {
+        Some(Some(doc)) => (StatusCode::OK, Json(doc_with_highlight(&doc, &params.hl))),
+        Some(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "id": id, "result": "not_found" })),
         ),
@@ -448,6 +552,91 @@ async fn get_handler(
             Json(serde_json::json!({ "id": id, "failed_shards": group })),
         ),
     }
+}
+
+pub fn content_type(format: &str) -> &'static str {
+    match format {
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pdf" => "application/pdf",
+        _ => "text/plain; charset=utf-8",
+    }
+}
+
+pub fn content_disposition(name: &str) -> String {
+    let ascii: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || ".-_ ".contains(c) { c } else { '_' })
+        .collect();
+    let mut encoded = String::new();
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || b".-_~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
+}
+
+async fn fetch_file(st: &AppState, id: &str) -> Option<Vec<u8>> {
+    let group = &st.groups[shard_for(id, st.groups.len())];
+    let client = &st.client;
+    for addr in group {
+        let Ok(mut url) = reqwest::Url::parse(addr) else {
+            continue;
+        };
+        if let Ok(mut segments) = url.path_segments_mut() {
+            segments.pop_if_empty().extend(["files", id]);
+        }
+        let resp = client.get(url).timeout(FILE_TIMEOUT).send().await;
+        match resp {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(bytes) => return Some(bytes.to_vec()),
+                Err(e) => tracing::warn!(shard = %addr, error = %e, "file request failed"),
+            },
+            Ok(resp) => tracing::warn!(shard = %addr, status = %resp.status(), "file not found"),
+            Err(e) => tracing::warn!(shard = %addr, error = %e, "file request failed"),
+        }
+    }
+    None
+}
+
+async fn file_handler(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    let doc = match find_doc(&st, &id).await {
+        Some(Some(doc)) => doc,
+        Some(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "id": id, "result": "not_found" })),
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "id": id, "result": "unavailable" })),
+            )
+                .into_response();
+        }
+    };
+    let original = if doc.meta.file {
+        fetch_file(&st, &id).await
+    } else {
+        None
+    };
+    let (bytes, format) = match original {
+        Some(bytes) => (bytes, doc.meta.format.as_str()),
+        None => (format!("{}\n\n{}\n", doc.title, doc.body).into_bytes(), "txt"),
+    };
+    let name = format!("{id}.{format}");
+    (
+        [
+            (header::CONTENT_TYPE, content_type(format).to_string()),
+            (header::CONTENT_DISPOSITION, content_disposition(&name)),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 async fn index_in_groups(st: &AppState, docs: Vec<Doc>) -> DocsResponse {
@@ -528,8 +717,11 @@ async fn delete_handler(
 async fn put_handler(
     State(st): State<AppState>,
     Path(id): Path<String>,
-    Json(doc): Json<DocBody>,
+    Json(mut doc): Json<DocBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if doc.updated == 0 {
+        doc.updated = now();
+    }
     forward_write(&st, &id, reqwest::Method::PUT, Some(&doc)).await
 }
 
@@ -564,8 +756,17 @@ async fn search_handler(
     let mut total = 0;
     let mut variants = HashMap::new();
     let client = &st.client;
-    if !terms.is_empty() && params.fuzzy {
-        let expand_req = &ExpandRequest { terms: terms.clone() };
+    if params.synonyms {
+        for term in &terms {
+            add_variants(&mut variants, &terms, term, synonyms(term));
+        }
+    }
+    let prefix = last_prefix(&params.q).filter(|p| params.prefix && terms.contains(&p.term));
+    if !terms.is_empty() && (params.fuzzy || prefix.is_some()) {
+        let expand_req = &ExpandRequest {
+            terms: if params.fuzzy { terms.clone() } else { Vec::new() },
+            prefix: prefix.as_ref().map(|p| p.word.clone()),
+        };
         let results = join_all(st.groups.iter().map(|group| {
             read_any(group, "expand", move |s| {
                 post_json::<_, ExpandResponse>(client, format!("{s}/expand"), expand_req)
@@ -579,8 +780,16 @@ async fn search_handler(
                 None => mark_failed(&mut failed, group),
             }
         }
-        variants = merge_expansions(&terms, &parts);
+        for (term, found) in merge_expansions(&terms, &parts) {
+            add_variants(&mut variants, &terms, &term, found);
+        }
+        if let Some(prefix) = &prefix {
+            let completions: Vec<String> =
+                parts.iter().flat_map(|p| p.completions.clone()).collect();
+            add_variants(&mut variants, &terms, &prefix.term, completions);
+        }
     }
+    let all_terms = with_variants(&terms, &variants);
     if !terms.is_empty() {
         let stats_req = &StatsRequest {
             terms: with_variants(&terms, &variants),
@@ -608,6 +817,7 @@ async fn search_handler(
             search_req.phrases = parsed.phrases;
             search_req.all = all;
             search_req.variants = variants;
+            search_req.proximity = params.proximity;
             let search_req = &search_req;
             let results = join_all(alive.iter().map(|(_, order)| {
                 read_any(order, "search", move |s| {
@@ -635,6 +845,7 @@ async fn search_handler(
         size,
         failed_shards: failed,
         hits,
+        terms: all_terms,
     }))
 }
 
@@ -762,11 +973,20 @@ pub fn router(groups: Vec<Vec<String>>) -> Result<Router> {
         client,
     };
     Ok(Router::new()
-        .route("/docs", get(list_handler).post(docs_handler))
+        .route(
+            "/docs",
+            get(list_handler)
+                .post(docs_handler)
+                .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
+        )
         .route(
             "/docs/{id}",
-            get(get_handler).put(put_handler).delete(delete_handler),
+            get(get_handler)
+                .put(put_handler)
+                .delete(delete_handler)
+                .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT)),
         )
+        .route("/docs/{id}/file", get(file_handler))
         .route(
             "/upload",
             post(upload_handler).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),

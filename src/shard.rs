@@ -1,9 +1,10 @@
 use crate::fuzzy::{self, ExpandRequest, ExpandResponse, FUZZY_WEIGHT, Suggestion};
-use crate::index::{Doc, Index};
+use crate::index::{Doc, Index, Meta};
 use crate::query::{Segment, snippet};
 use crate::scoring;
 use crate::storage::{SNAPSHOT_FILE, Store};
-use axum::extract::{Path, Query, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -43,6 +44,8 @@ pub struct SearchRequest {
     pub all: bool,
     #[serde(default)]
     pub variants: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub proximity: bool,
     pub k: usize,
     pub n: u64,
     pub avgdl: f64,
@@ -85,6 +88,14 @@ pub struct DocBody {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    #[serde(default)]
+    pub updated: u64,
+}
+
+pub fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,6 +165,60 @@ fn has_phrase(index: &Index, doc: u32, phrase: &[String]) -> bool {
     })
 }
 
+pub const PROXIMITY_WEIGHT: f64 = 1.0;
+
+fn positions_of(index: &Index, doc: u32, members: &[&str]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for term in members {
+        let posting = index.postings.get(*term).and_then(|list| {
+            list.binary_search_by_key(&doc, |p| p.doc)
+                .ok()
+                .and_then(|i| list.get(i))
+        });
+        if let Some(posting) = posting {
+            out.extend_from_slice(&posting.positions);
+        }
+    }
+    out
+}
+
+pub fn proximity(groups: &[Vec<u32>]) -> f64 {
+    let lists: Vec<&Vec<u32>> = groups.iter().filter(|g| !g.is_empty()).collect();
+    let m = lists.len();
+    if m < 2 {
+        return 0.0;
+    }
+    let mut events: Vec<(u32, usize)> = lists
+        .iter()
+        .enumerate()
+        .flat_map(|(g, list)| list.iter().map(move |&pos| (pos, g)))
+        .collect();
+    events.sort_unstable();
+    let mut counts = vec![0usize; m];
+    let mut covered = 0;
+    let mut best = u32::MAX;
+    let mut left = 0;
+    for &(pos, g) in &events {
+        if counts[g] == 0 {
+            covered += 1;
+        }
+        counts[g] += 1;
+        while covered == m {
+            let Some(&(start, first)) = events.get(left) else {
+                break;
+            };
+            best = best.min(pos - start + 1);
+            counts[first] -= 1;
+            if counts[first] == 0 {
+                covered -= 1;
+            }
+            left += 1;
+        }
+    }
+    let gap = (best as usize + 1).saturating_sub(m).max(1);
+    PROXIMITY_WEIGHT * (m - 1) as f64 / gap as f64
+}
+
 pub fn search(index: &Index, req: &SearchRequest) -> SearchResult {
     if req.n == 0 || req.avgdl <= 0.0 {
         return SearchResult::default();
@@ -199,6 +264,24 @@ pub fn search(index: &Index, req: &SearchRequest) -> SearchResult {
                 .any(|&(m, ..)| m == t || variants.iter().any(|v| v == m))
         })
     };
+    let groups: Vec<Vec<&str>> = unique
+        .iter()
+        .map(|&t| {
+            std::iter::once(t)
+                .chain(req.variants.get(t).into_iter().flatten().map(String::as_str))
+                .collect()
+        })
+        .collect();
+    let bonus = |doc: u32| {
+        if !req.proximity || groups.len() < 2 {
+            return 0.0;
+        }
+        let positions: Vec<Vec<u32>> = groups
+            .iter()
+            .map(|members| positions_of(index, doc, members))
+            .collect();
+        proximity(&positions)
+    };
     let mut scored: Vec<(f64, &Doc)> = matches
         .into_iter()
         .filter(|(doc, terms)| {
@@ -212,7 +295,8 @@ pub fn search(index: &Index, req: &SearchRequest) -> SearchResult {
                 .map(|&(_, tf, df, w)| {
                     w * scoring::term_score(scoring::idf(req.n, df), tf, len, req.avgdl)
                 })
-                .sum();
+                .sum::<f64>()
+                + bonus(doc);
             Some((score, stored))
         })
         .collect();
@@ -232,6 +316,7 @@ pub fn search(index: &Index, req: &SearchRequest) -> SearchResult {
     SearchResult { total, hits }
 }
 
+pub const SHARD_BODY_LIMIT: usize = 256 * 1024 * 1024;
 pub const LIST_DEFAULT: usize = 50;
 pub const LIST_MAX: usize = 200;
 
@@ -240,6 +325,16 @@ pub struct DocInfo {
     pub id: String,
     pub title: String,
     pub words: u64,
+    #[serde(default)]
+    pub format: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub created: u64,
+    #[serde(default)]
+    pub updated: u64,
+    #[serde(default)]
+    pub file: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -249,42 +344,139 @@ pub struct DocList {
     pub more: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Sort {
+    #[default]
+    Id,
+    Title,
+    Created,
+    Size,
+}
+
+impl Sort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sort::Id => "id",
+            Sort::Title => "title",
+            Sort::Created => "created",
+            Sort::Size => "size",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct ListParams {
     #[serde(default)]
     pub after: String,
     pub size: Option<usize>,
+    #[serde(default)]
+    pub sort: Sort,
+    #[serde(default)]
+    pub desc: bool,
+    #[serde(default)]
+    pub format: String,
 }
 
 impl ListParams {
     pub fn size(&self) -> usize {
         self.size.unwrap_or(LIST_DEFAULT).clamp(1, LIST_MAX)
     }
+
+    pub fn first(size: usize) -> Self {
+        Self {
+            size: Some(size),
+            ..Self::default()
+        }
+    }
 }
 
-pub fn list_docs(index: &Index, after: &str, size: usize) -> DocList {
-    let mut ids: Vec<&String> = index
-        .ids
-        .keys()
-        .filter(|id| id.as_str() > after)
-        .collect();
-    ids.sort_unstable();
-    let more = ids.len() > size;
-    let docs = ids
-        .into_iter()
-        .take(size)
-        .filter_map(|id| get_doc(index, id))
-        .map(|doc| DocInfo {
-            words: doc.body.unicode_words().count() as u64,
-            id: doc.id.clone(),
-            title: doc.title.clone(),
+pub const CURSOR_SEP: char = '\u{1f}';
+
+pub fn sort_key(sort: Sort, id: &str, title: &str, meta: &Meta) -> String {
+    match sort {
+        Sort::Id => id.to_string(),
+        Sort::Title => title.to_lowercase(),
+        Sort::Created => format!("{:020}", meta.created),
+        Sort::Size => format!("{:020}", meta.size),
+    }
+}
+
+pub fn info_key(sort: Sort, info: &DocInfo) -> (String, String) {
+    let meta = Meta {
+        format: String::new(),
+        size: info.size,
+        created: info.created,
+        updated: info.updated,
+        file: info.file,
+    };
+    (sort_key(sort, &info.id, &info.title, &meta), info.id.clone())
+}
+
+pub fn cursor(sort: Sort, info: &DocInfo) -> String {
+    match sort {
+        Sort::Id => info.id.clone(),
+        _ => {
+            let (key, id) = info_key(sort, info);
+            format!("{key}{CURSOR_SEP}{id}")
+        }
+    }
+}
+
+pub fn parse_cursor(after: &str) -> Option<(String, String)> {
+    if after.is_empty() {
+        return None;
+    }
+    Some(match after.split_once(CURSOR_SEP) {
+        Some((key, id)) => (key.to_string(), id.to_string()),
+        None => (after.to_string(), after.to_string()),
+    })
+}
+
+pub fn order(desc: bool, a: &(String, String), b: &(String, String)) -> std::cmp::Ordering {
+    if desc { b.cmp(a) } else { a.cmp(b) }
+}
+
+pub fn doc_info(doc: &Doc) -> DocInfo {
+    DocInfo {
+        words: doc.body.unicode_words().count() as u64,
+        id: doc.id.clone(),
+        title: doc.title.clone(),
+        format: doc.meta.format.clone(),
+        size: doc.meta.size,
+        created: doc.meta.created,
+        updated: doc.meta.updated,
+        file: doc.meta.file,
+    }
+}
+
+pub fn list_docs(index: &Index, params: &ListParams) -> DocList {
+    let size = params.size();
+    let bound = parse_cursor(&params.after);
+    let mut total = 0u64;
+    let mut keyed: Vec<((String, String), &Doc)> = index
+        .docs
+        .values()
+        .filter(|doc| params.format.is_empty() || doc.meta.format == params.format)
+        .inspect(|_| total += 1)
+        .map(|doc| {
+            let key = sort_key(params.sort, &doc.id, &doc.title, &doc.meta);
+            ((key, doc.id.clone()), doc)
+        })
+        .filter(|(key, _)| {
+            bound
+                .as_ref()
+                .is_none_or(|b| order(params.desc, key, b) == std::cmp::Ordering::Greater)
         })
         .collect();
-    DocList {
-        total: index.len() as u64,
-        docs,
-        more,
-    }
+    keyed.sort_by(|a, b| order(params.desc, &a.0, &b.0));
+    let more = keyed.len() > size;
+    let docs = keyed
+        .into_iter()
+        .take(size)
+        .map(|(_, doc)| doc_info(doc))
+        .collect();
+    DocList { total, docs, more }
 }
 
 pub fn get_doc<'a>(index: &'a Index, id: &str) -> Option<&'a Doc> {
@@ -295,7 +487,7 @@ async fn list_handler(
     State(store): State<SharedStore>,
     Query(params): Query<ListParams>,
 ) -> Json<DocList> {
-    Json(list_docs(&store.read().await.index, &params.after, params.size()))
+    Json(list_docs(&store.read().await.index, &params))
 }
 
 async fn get_handler(
@@ -335,16 +527,58 @@ async fn put_handler(
     Path(id): Path<String>,
     Json(doc): Json<DocBody>,
 ) -> Result<(StatusCode, Json<WriteResult>), (StatusCode, String)> {
+    let mut store = store.write().await;
+    let old = get_doc(&store.index, &id).map(|d| d.meta.clone());
+    let updated = if doc.updated > 0 { doc.updated } else { now() };
+    let mut meta = old.clone().unwrap_or_else(|| Meta {
+        format: "txt".to_string(),
+        created: updated,
+        ..Meta::default()
+    });
+    if old.is_some() {
+        meta.updated = updated;
+    }
+    if !meta.file {
+        meta.size = (doc.title.len() + 1 + doc.body.len()) as u64;
+    }
     let doc = Doc {
         id: id.clone(),
         title: doc.title,
         body: doc.body,
+        meta,
     };
-    let existed = store.write().await.update(doc).map_err(internal)?;
+    let existed = store.update(doc).map_err(internal)?;
     if existed {
         Ok((StatusCode::OK, write_result(id, "updated")))
     } else {
         Ok((StatusCode::CREATED, write_result(id, "created")))
+    }
+}
+
+async fn get_file_handler(
+    State(store): State<SharedStore>,
+    Path(id): Path<String>,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    match store.read().await.get_file(&id).map_err(internal)? {
+        Some(bytes) => Ok(bytes),
+        None => Err((StatusCode::NOT_FOUND, "not_found".to_string())),
+    }
+}
+
+async fn put_file_handler(
+    State(store): State<SharedStore>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<WriteResult>), (StatusCode, String)> {
+    if store
+        .write()
+        .await
+        .put_file(&id, body.to_vec())
+        .map_err(internal)?
+    {
+        Ok((StatusCode::OK, write_result(id, "stored")))
+    } else {
+        Ok((StatusCode::NOT_FOUND, write_result(id, "not_found")))
     }
 }
 
@@ -404,7 +638,12 @@ async fn expand_handler(
     State(store): State<SharedStore>,
     Json(req): Json<ExpandRequest>,
 ) -> Json<ExpandResponse> {
-    Json(fuzzy::expand(&store.read().await.index, &req.terms))
+    let store = store.read().await;
+    let mut response = fuzzy::expand(&store.index, &req.terms);
+    if let Some(prefix) = &req.prefix {
+        response.completions = fuzzy::complete(&store.index, prefix);
+    }
+    Json(response)
 }
 
 pub fn router(store: SharedStore) -> Router {
@@ -416,10 +655,12 @@ pub fn router(store: SharedStore) -> Router {
             "/docs/{id}",
             get(get_handler).put(put_handler).delete(delete_handler),
         )
+        .route("/files/{id}", get(get_file_handler).put(put_file_handler))
         .route("/stats", post(stats_handler))
         .route("/search", post(search_handler))
         .route("/snapshot", post(snapshot_handler))
         .route("/health", get(health_handler))
+        .layer(DefaultBodyLimit::max(SHARD_BODY_LIMIT))
         .with_state(store)
 }
 

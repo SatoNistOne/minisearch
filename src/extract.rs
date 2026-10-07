@@ -1,4 +1,4 @@
-use crate::index::Doc;
+use crate::index::{Doc, Meta};
 use anyhow::{Context, Result, bail, ensure};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -7,7 +7,7 @@ use std::io::{Cursor, Read};
 pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_XML_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_TITLE_CHARS: usize = 200;
-pub const EXTENSIONS: [&str; 2] = ["txt", "docx"];
+pub const EXTENSIONS: [&str; 3] = ["txt", "docx", "pdf"];
 
 pub fn split_name(file_name: &str) -> Result<(String, String)> {
     let base = file_name
@@ -17,7 +17,7 @@ pub fn split_name(file_name: &str) -> Result<(String, String)> {
         .trim();
     let (stem, ext) = base
         .rsplit_once('.')
-        .with_context(|| format!("у файла {base} нет расширения, нужен .txt или .docx"))?;
+        .with_context(|| format!("у файла {base} нет расширения, нужен .txt, .docx или .pdf"))?;
     let stem = stem.trim();
     ensure!(!stem.is_empty(), "пустое имя файла {base}");
     Ok((stem.to_string(), ext.to_lowercase()))
@@ -36,11 +36,52 @@ pub fn extract(file_name: &str, bytes: &[u8]) -> Result<Doc> {
             .trim_start_matches('\u{feff}')
             .to_string(),
         "docx" => docx_text(bytes)?,
-        _ => bail!("формат .{ext} не поддерживается, нужен .txt или .docx"),
+        "pdf" => pdf_text(bytes)?,
+        _ => bail!("формат .{ext} не поддерживается, нужен .txt, .docx или .pdf"),
     };
     let (title, body) = split_title(&text, &id);
-    ensure!(!text.trim().is_empty(), "в файле нет текста");
-    Ok(Doc { id, title, body })
+    ensure!(
+        !text.trim().is_empty(),
+        if ext == "pdf" {
+            "в PDF нет текста (возможно, это скан)"
+        } else {
+            "в файле нет текста"
+        }
+    );
+    Ok(Doc {
+        id,
+        title,
+        body,
+        meta: Meta {
+            format: ext,
+            size: bytes.len() as u64,
+            ..Meta::default()
+        },
+    })
+}
+
+pub fn pdf_text(bytes: &[u8]) -> Result<String> {
+    let result = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes));
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => bail!("файл .pdf повреждён или зашифрован: {e}"),
+        Err(_) => bail!("не удалось прочитать файл .pdf"),
+    };
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    let mut out = String::new();
+    let mut blank = 0;
+    for line in lines {
+        if line.trim().is_empty() {
+            blank += 1;
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(if blank > 0 { "\n\n" } else { "\n" });
+        }
+        blank = 0;
+        out.push_str(line.trim_start());
+    }
+    Ok(out)
 }
 
 fn split_title(text: &str, fallback: &str) -> (String, String) {

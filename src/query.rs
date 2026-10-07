@@ -1,4 +1,4 @@
-use crate::analyzer::analyze;
+use crate::analyzer::{analyze, is_stop_word, normalize, stem};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use unicode_segmentation::UnicodeSegmentation;
@@ -17,9 +17,31 @@ pub struct Segment {
     pub hl: bool,
 }
 
+pub const QUOTES: [char; 6] = ['"', '\u{201c}', '\u{201d}', '\u{201e}', '\u{ab}', '\u{bb}'];
+pub const MIN_PREFIX_CHARS: usize = 2;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Prefix {
+    pub word: String,
+    pub term: String,
+}
+
+pub fn last_prefix(q: &str) -> Option<Prefix> {
+    let last = q.chars().last()?;
+    if !last.is_alphanumeric() {
+        return None;
+    }
+    let word = normalize(q.unicode_words().next_back()?);
+    if word.chars().count() < MIN_PREFIX_CHARS || is_stop_word(&word) {
+        return None;
+    }
+    let term = stem(word.clone());
+    Some(Prefix { word, term })
+}
+
 pub fn parse_query(q: &str) -> ParsedQuery {
     let mut parsed = ParsedQuery::default();
-    for (i, part) in q.split('"').enumerate() {
+    for (i, part) in q.split(QUOTES).enumerate() {
         let tokens = analyze(part);
         if i % 2 == 1 && !tokens.is_empty() {
             parsed.phrases.push(tokens.clone());
@@ -56,6 +78,20 @@ pub fn snippet(body: &str, terms: &HashSet<&str>) -> Vec<Segment> {
         stop = offset + word.len();
     }
     push(&mut segments, body.get(cursor..stop).unwrap_or_default(), false);
+    segments
+}
+
+pub fn highlight(text: &str, terms: &HashSet<&str>) -> Vec<Segment> {
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    for (offset, word) in text.unicode_word_indices() {
+        if analyze(word).iter().any(|t| terms.contains(t.as_str())) {
+            push(&mut segments, text.get(cursor..offset).unwrap_or_default(), false);
+            push(&mut segments, word, true);
+            cursor = offset + word.len();
+        }
+    }
+    push(&mut segments, text.get(cursor..).unwrap_or_default(), false);
     segments
 }
 
