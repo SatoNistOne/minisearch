@@ -1,0 +1,2 @@
+How search engines rank documents
+A search engine keeps an inverted index that maps every term to the documents containing it. Ranking functions such as BM25 score documents by term frequency and document length. Rare terms get a higher inverse document frequency. The best matching documents are shown first.

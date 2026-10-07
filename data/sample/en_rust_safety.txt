@@ -1,0 +1,2 @@
+Why Rust is fast and safe
+Rust offers memory safety without a garbage collector. The borrow checker catches data races at compile time. Many teams use Rust to build search engines, databases and web servers. Its async ecosystem around tokio makes network services fast.

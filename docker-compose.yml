@@ -1,0 +1,82 @@
+x-shard: &shard
+  image: minisearch
+  pull_policy: never
+  command: ["shard", "--port", "7001", "--data-dir", "/data"]
+  healthcheck:
+    test: ["CMD", "curl", "-fs", "http://127.0.0.1:7001/health"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+  restart: unless-stopped
+
+services:
+  shard1a:
+    <<: *shard
+    volumes:
+      - shard1a-data:/data
+  shard1b:
+    <<: *shard
+    volumes:
+      - shard1b-data:/data
+  shard2a:
+    <<: *shard
+    volumes:
+      - shard2a-data:/data
+  shard2b:
+    <<: *shard
+    volumes:
+      - shard2b-data:/data
+  shard3a:
+    <<: *shard
+    volumes:
+      - shard3a-data:/data
+  shard3b:
+    <<: *shard
+    volumes:
+      - shard3b-data:/data
+  coordinator:
+    build: .
+    image: minisearch
+    command:
+      - coordinator
+      - --port
+      - "7000"
+      - --shards
+      - http://shard1a:7001|http://shard1b:7001,http://shard2a:7001|http://shard2b:7001,http://shard3a:7001|http://shard3b:7001
+    ports:
+      - "7000:7000"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:7000/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+    depends_on:
+      shard1a:
+        condition: service_healthy
+      shard1b:
+        condition: service_healthy
+      shard2a:
+        condition: service_healthy
+      shard2b:
+        condition: service_healthy
+      shard3a:
+        condition: service_healthy
+      shard3b:
+        condition: service_healthy
+  loader:
+    image: minisearch
+    pull_policy: never
+    profiles: ["load"]
+    command: ["load", "--coordinator", "http://coordinator:7000", "--dir", "/app/data/sample"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+volumes:
+  shard1a-data:
+  shard1b-data:
+  shard2a-data:
+  shard2b-data:
+  shard3a-data:
+  shard3b-data:

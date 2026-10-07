@@ -1,0 +1,2 @@
+Exploring Mars with rovers
+Rovers on Mars study rocks and search for signs of ancient water. A trip to Mars takes about seven months. Engineers write rover software that must never crash. Images from the rovers are stored in a searchable archive.

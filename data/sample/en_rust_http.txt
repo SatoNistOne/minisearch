@@ -1,0 +1,2 @@
+Writing an HTTP server in Rust
+The axum framework makes it easy to write an HTTP server in Rust. Handlers receive JSON requests and return JSON responses. Shared state such as a search index lives behind an Arc and a RwLock. The tokio runtime runs the server on many threads.

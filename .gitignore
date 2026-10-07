@@ -1,0 +1,13 @@
+/target
+.venv
+__pycache__
+/logs
+/tests
+/tools
+/build-all.fish
+/run.fish
+/docker.fish
+/CLAUDE.md
+/PROGRESS.md
+/SPEC.md
+/SPEC-2.md

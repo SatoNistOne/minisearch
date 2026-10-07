@@ -1,0 +1,2 @@
+Distributed search with shards
+A distributed search engine splits the index into shards on different nodes. The coordinator sends each query to every shard in parallel and merges the results. Global statistics keep BM25 scores consistent across shards. A failed shard is skipped so the search still answers.
