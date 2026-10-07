@@ -29,6 +29,8 @@ enum Command {
         port: u16,
         #[arg(long, value_delimiter = ',', required = true)]
         shards: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        drain: Vec<String>,
     },
     Load {
         #[arg(long)]
@@ -91,7 +93,11 @@ async fn serve(command: Command) -> Result<()> {
             data_dir,
             snapshot_every,
         } => shard::run(port, data_dir, snapshot_every).await,
-        Command::Coordinator { port, shards } => coordinator::run(port, shards).await,
+        Command::Coordinator {
+            port,
+            shards,
+            drain,
+        } => coordinator::run(port, shards, drain).await,
         Command::Load { coordinator, dir } => load(&coordinator, &dir).await,
         Command::Extract { .. } => Ok(()),
     }

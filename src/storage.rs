@@ -23,6 +23,7 @@ pub enum Op {
     AddAt(Vec<Doc>, u64),
     PutAt(Doc, u64),
     DeleteAt(String, u64),
+    Evict(String),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -259,14 +260,28 @@ impl Store {
         Ok(self.put_at(doc, version)?.unwrap_or(true))
     }
 
+    pub fn known(&self, id: &str) -> bool {
+        self.index.contains(id) || self.versions.deleted.contains_key(id)
+    }
+
     pub fn put_at(&mut self, doc: Doc, version: u64) -> Result<Option<bool>> {
-        if version <= self.version(&doc.id) {
+        if self.known(&doc.id) && version <= self.version(&doc.id) {
             return Ok(None);
         }
         let existed = self.index.contains(&doc.id);
         self.log_apply(Op::PutAt(doc, version))?;
         self.maybe_snapshot()?;
         Ok(Some(existed))
+    }
+
+    pub fn evict(&mut self, id: &str, version: u64) -> Result<bool> {
+        if !self.index.contains(id) || self.version(id) > version {
+            return Ok(false);
+        }
+        self.log_apply(Op::Evict(id.to_string()))?;
+        self.remove_file(id)?;
+        self.maybe_snapshot()?;
+        Ok(true)
     }
 
     fn log_apply(&mut self, op: Op) -> Result<()> {
@@ -449,6 +464,12 @@ fn apply(index: &mut Index, versions: &mut Versions, op: Op) -> Result<()> {
             index.delete(&id);
             versions.docs.remove(&id);
             versions.deleted.insert(id, version);
+            Ok(())
+        }
+        Op::Evict(id) => {
+            index.delete(&id);
+            versions.docs.remove(&id);
+            versions.deleted.remove(&id);
             Ok(())
         }
     }

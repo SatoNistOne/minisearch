@@ -26,10 +26,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use std::time::{Duration, Instant};
-use xxhash_rust::xxh3::xxh3_64;
 
 #[derive(Debug, Clone)]
 pub enum Extractor {
@@ -43,6 +43,8 @@ struct AppState {
     client: reqwest::Client,
     extractor: Extractor,
     slots: Arc<Semaphore>,
+    moving: Arc<AtomicBool>,
+    drain: Arc<Vec<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,9 +121,7 @@ async fn analyze_handler(Query(params): Query<AnalyzeParams>) -> Json<AnalyzeRes
 
 pub const MAX_WINDOW: usize = 1000;
 
-pub fn shard_for(id: &str, shards: usize) -> usize {
-    (xxh3_64(id.as_bytes()) % shards as u64) as usize
-}
+pub use crate::shard::shard_for;
 
 pub fn query_terms(q: &str) -> Vec<String> {
     parse_query(q).terms
@@ -240,6 +240,8 @@ pub fn merge_hits(parts: Vec<(String, Vec<Hit>)>, k: usize) -> Vec<ShardHit> {
         })
         .collect();
     hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+    let mut seen = HashSet::new();
+    hits.retain(|hit| seen.insert(hit.id.clone()));
     hits.truncate(k);
     hits
 }
@@ -291,6 +293,9 @@ async fn docs_handler(
         if doc.meta.size == 0 {
             doc.meta.size = (doc.title.len() + 1 + doc.body.len()) as u64;
         }
+    }
+    if st.moving.load(Ordering::Relaxed) {
+        join_all(docs.iter().map(|doc| settle(&st, &doc.id))).await;
     }
     let response = index_in_groups(&st, docs).await;
     let status = if response.failed_shards.is_empty() {
@@ -445,6 +450,7 @@ async fn upload_handler(
         doc.meta.created = now();
         doc.meta.file = true;
         let id = doc.id.clone();
+        settle(st, &id).await;
         let mut response = index_in_groups(st, vec![doc]).await;
         if response.indexed > 0 {
             response.failed_shards.extend(store_file(st, &id, &bytes).await);
@@ -587,6 +593,31 @@ pub fn doc_with_highlight(doc: &Doc, hl: &str) -> serde_json::Value {
     value
 }
 
+async fn settle(st: &AppState, id: &str) {
+    if !st.moving.load(Ordering::Relaxed) {
+        return;
+    }
+    let home = shard_for(id, st.groups.len());
+    if let Some(Some(_)) = find_doc(st, id).await {
+        return;
+    }
+    let others = st
+        .groups
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != home)
+        .map(|(_, group)| group)
+        .chain(st.drain.iter());
+    for group in others {
+        for addr in group {
+            let ids = [id.to_string()];
+            if let Err(e) = crate::sync::move_docs(&st.client, addr, &st.groups[home], &ids).await {
+                tracing::warn!(shard = %addr, id, error = %e, "move to new shard failed");
+            }
+        }
+    }
+}
+
 async fn find_doc(st: &AppState, id: &str) -> Option<Option<Doc>> {
     let group = &st.groups[shard_for(id, st.groups.len())];
     let client = &st.client;
@@ -600,6 +631,7 @@ async fn get_handler(
     Path(id): Path<String>,
     Query(params): Query<GetParams>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    settle(&st, &id).await;
     let group = &st.groups[shard_for(&id, st.groups.len())];
     match find_doc(&st, &id).await {
         Some(Some(doc)) => (StatusCode::OK, Json(doc_with_highlight(&doc, &params.hl))),
@@ -662,6 +694,7 @@ async fn fetch_file(st: &AppState, id: &str) -> Option<Vec<u8>> {
 }
 
 async fn file_handler(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    settle(&st, &id).await;
     let doc = match find_doc(&st, &id).await {
         Some(Some(doc)) => doc,
         Some(None) => {
@@ -778,6 +811,7 @@ async fn delete_handler(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    settle(&st, &id).await;
     forward_write(&st, &id, reqwest::Method::DELETE, None).await
 }
 
@@ -786,6 +820,7 @@ async fn put_handler(
     Path(id): Path<String>,
     Json(mut doc): Json<DocBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    settle(&st, &id).await;
     if doc.updated == 0 {
         doc.updated = now();
     }
@@ -1036,6 +1071,19 @@ pub fn router(groups: Vec<Vec<String>>) -> Result<Router> {
 }
 
 pub fn router_with(groups: Vec<Vec<String>>, extractor: Extractor) -> Result<Router> {
+    build(groups, Vec::new(), extractor, Arc::new(AtomicBool::new(true)))
+}
+
+pub fn router_draining(groups: Vec<Vec<String>>, drain: Vec<Vec<String>>) -> Result<Router> {
+    build(groups, drain, Extractor::Thread, Arc::new(AtomicBool::new(true)))
+}
+
+fn build(
+    groups: Vec<Vec<String>>,
+    drain: Vec<Vec<String>>,
+    extractor: Extractor,
+    moving: Arc<AtomicBool>,
+) -> Result<Router> {
     anyhow::ensure!(groups.iter().all(|g| !g.is_empty()), "empty replica group");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -1046,6 +1094,8 @@ pub fn router_with(groups: Vec<Vec<String>>, extractor: Extractor) -> Result<Rou
         client,
         extractor,
         slots: Arc::new(Semaphore::new(workers)),
+        moving,
+        drain: Arc::new(drain),
     };
     Ok(Router::new()
         .route(
@@ -1075,15 +1125,25 @@ pub fn router_with(groups: Vec<Vec<String>>, extractor: Extractor) -> Result<Rou
         .with_state(state))
 }
 
-pub async fn run(port: u16, shards: Vec<String>) -> Result<()> {
+pub async fn run(port: u16, shards: Vec<String>, drain: Vec<String>) -> Result<()> {
     let groups = parse_groups(&shards)?;
+    let drain = if drain.is_empty() {
+        Vec::new()
+    } else {
+        parse_groups(&drain)?
+    };
+    anyhow::ensure!(
+        drain.iter().flatten().all(|a| !groups.iter().flatten().any(|g| g == a)),
+        "a shard cannot be both active and drained"
+    );
     let extractor = Extractor::Process {
         exe: std::env::current_exe().context("current exe")?,
         timeout: EXTRACT_TIMEOUT,
     };
-    let app = router_with(groups.clone(), extractor)?;
+    let moving = Arc::new(AtomicBool::new(true));
+    let app = build(groups.clone(), drain.clone(), extractor, moving.clone())?;
     tokio::spawn(async move {
-        if let Err(e) = crate::sync::run(groups).await {
+        if let Err(e) = crate::sync::run(groups, drain, moving).await {
             tracing::error!(error = %e, "replica sync stopped");
         }
     });

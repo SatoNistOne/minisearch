@@ -1,10 +1,11 @@
-use crate::index::Doc;
-use crate::shard::{SyncApply, SyncResult};
+use crate::shard::{Evict, SyncApply, SyncDoc, SyncResult, holds, shard_for};
 use crate::storage::{Digest, SyncEntry};
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub const SYNC_EVERY: Duration = Duration::from_secs(5);
@@ -81,7 +82,13 @@ fn file_url(addr: &str, id: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
-async fn copy_file(client: &reqwest::Client, from: &str, to: &str, id: &str) -> Result<bool> {
+async fn copy_file(
+    client: &reqwest::Client,
+    from: &str,
+    to: &str,
+    id: &str,
+    version: u64,
+) -> Result<bool> {
     let resp = client
         .get(file_url(from, id)?)
         .timeout(SYNC_TIMEOUT)
@@ -91,8 +98,11 @@ async fn copy_file(client: &reqwest::Client, from: &str, to: &str, id: &str) -> 
         return Ok(false);
     }
     let bytes = resp.error_for_status()?.bytes().await?;
+    let mut url = file_url(to, id)?;
+    url.query_pairs_mut()
+        .append_pair("version", &version.to_string());
     client
-        .put(file_url(to, id)?)
+        .put(url)
         .timeout(SYNC_TIMEOUT)
         .body(bytes)
         .send()
@@ -101,7 +111,12 @@ async fn copy_file(client: &reqwest::Client, from: &str, to: &str, id: &str) -> 
     Ok(true)
 }
 
-pub async fn sync_group(client: &reqwest::Client, group: &[String]) -> SyncReport {
+pub async fn sync_group(
+    client: &reqwest::Client,
+    group: &[String],
+    index: usize,
+    groups: usize,
+) -> SyncReport {
     let mut report = SyncReport::default();
     if group.len() < 2 {
         return report;
@@ -131,6 +146,7 @@ pub async fn sync_group(client: &reqwest::Client, group: &[String]) -> SyncRepor
             Ok(list) => replicas.push((
                 *i,
                 list.into_iter()
+                    .filter(|e| shard_for(&e.id, groups) == index)
                     .map(|e| (e.id, (e.version, e.deleted)))
                     .collect(),
             )),
@@ -204,20 +220,10 @@ async fn copy_docs(
     items: &[(String, u64)],
 ) -> Result<SyncReport> {
     let ids: Vec<&String> = items.iter().map(|(id, _)| id).collect();
-    let docs: Vec<Doc> = post_json(client, format!("{from}/sync/fetch"), &ids)
+    let docs: Vec<SyncDoc> = post_json(client, format!("{from}/sync/fetch"), &ids)
         .await
         .context("fetch docs")?;
-    let versions: HashMap<&str, u64> = items.iter().map(|(id, v)| (id.as_str(), *v)).collect();
-    let applies: Vec<SyncApply> = docs
-        .iter()
-        .filter_map(|doc| {
-            versions.get(doc.id.as_str()).map(|&version| SyncApply {
-                id: doc.id.clone(),
-                version,
-                doc: Some(doc.clone()),
-            })
-        })
-        .collect();
+    let applies = to_applies(&docs);
     let result: SyncResult = post_json(client, format!("{to}/sync"), &applies)
         .await
         .context("apply docs")?;
@@ -225,25 +231,147 @@ async fn copy_docs(
         copied: result.applied,
         ..SyncReport::default()
     };
-    for doc in docs.iter().filter(|doc| doc.meta.file) {
-        match copy_file(client, from, to, &doc.id).await {
+    for d in docs.iter().filter(|d| d.doc.meta.file) {
+        match copy_file(client, from, to, &d.doc.id, d.version).await {
             Ok(true) => report.files += 1,
             Ok(false) => {}
-            Err(e) => report.errors.push(format!("file {}: {e:#}", doc.id)),
+            Err(e) => report.errors.push(format!("file {}: {e:#}", d.doc.id)),
         }
     }
     Ok(report)
 }
 
+fn to_applies(docs: &[SyncDoc]) -> Vec<SyncApply> {
+    docs.iter()
+        .map(|d| SyncApply {
+            id: d.doc.id.clone(),
+            version: d.version,
+            doc: Some(d.doc.clone()),
+        })
+        .collect()
+}
+
+pub async fn move_docs(
+    client: &reqwest::Client,
+    from: &str,
+    target: &[String],
+    ids: &[String],
+) -> Result<usize> {
+    let docs: Vec<SyncDoc> = post_json(client, format!("{from}/sync/fetch"), &ids)
+        .await
+        .context("fetch docs")?;
+    if docs.is_empty() {
+        return Ok(0);
+    }
+    let applies = to_applies(&docs);
+    let mut failed = HashSet::new();
+    for to in target {
+        let result: SyncResult = post_json(client, format!("{to}/sync"), &applies)
+            .await
+            .with_context(|| format!("apply to {to}"))?;
+        let state: HashMap<&str, &SyncEntry> =
+            result.state.iter().map(|e| (e.id.as_str(), e)).collect();
+        for d in &docs {
+            if !state.get(d.doc.id.as_str()).is_some_and(|e| holds(e, d.version)) {
+                failed.insert(d.doc.id.clone());
+            }
+        }
+        for d in docs.iter().filter(|d| d.doc.meta.file) {
+            if copy_file(client, from, to, &d.doc.id, d.version).await.is_err() {
+                failed.insert(d.doc.id.clone());
+            }
+        }
+    }
+    let evicts: Vec<Evict> = docs
+        .iter()
+        .filter(|d| !failed.contains(&d.doc.id))
+        .map(|d| Evict {
+            id: d.doc.id.clone(),
+            version: d.version,
+        })
+        .collect();
+    let result: SyncResult = post_json(client, format!("{from}/sync/evict"), &evicts)
+        .await
+        .context("evict docs")?;
+    Ok(result.applied)
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RebalanceReport {
+    pub moved: usize,
+    pub pending: bool,
+    pub errors: Vec<String>,
+}
+
+pub async fn rebalance(
+    client: &reqwest::Client,
+    groups: &[Vec<String>],
+    drain: &[Vec<String>],
+) -> RebalanceReport {
+    let mut report = RebalanceReport::default();
+    let sources = groups
+        .iter()
+        .enumerate()
+        .chain(drain.iter().map(|g| (groups.len(), g)));
+    for (index, group) in sources {
+        for from in group {
+            let url = format!("{from}/sync/misplaced?group={index}&groups={}", groups.len());
+            let entries: Vec<SyncEntry> = match get_json(client, url).await {
+                Ok(entries) => entries,
+                Err(_) => {
+                    report.pending = true;
+                    continue;
+                }
+            };
+            let mut by_target: HashMap<usize, Vec<String>> = HashMap::new();
+            for e in entries {
+                by_target
+                    .entry(shard_for(&e.id, groups.len()))
+                    .or_default()
+                    .push(e.id);
+            }
+            for (target, ids) in by_target {
+                for chunk in ids.chunks(SYNC_BATCH) {
+                    match move_docs(client, from, &groups[target], chunk).await {
+                        Ok(moved) => {
+                            report.moved += moved;
+                            if moved < chunk.len() {
+                                report.pending = true;
+                            }
+                        }
+                        Err(e) => {
+                            report.pending = true;
+                            report.errors.push(format!("{from}: {e:#}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    report
+}
+
 pub async fn sync_all(client: &reqwest::Client, groups: &[Vec<String>]) -> SyncReport {
     let mut report = SyncReport::default();
-    for r in join_all(groups.iter().map(|g| sync_group(client, g))).await {
+    let total = groups.len();
+    for r in join_all(
+        groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| sync_group(client, g, i, total)),
+    )
+    .await
+    {
         report.merge(r);
     }
     report
 }
 
-pub async fn run(groups: Vec<Vec<String>>) -> Result<()> {
+pub async fn run(
+    groups: Vec<Vec<String>>,
+    drain: Vec<Vec<String>>,
+    moving: Arc<AtomicBool>,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
@@ -251,6 +379,11 @@ pub async fn run(groups: Vec<Vec<String>>) -> Result<()> {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+        let moved = rebalance(&client, &groups, &drain).await;
+        moving.store(moved.pending || moved.moved > 0, Ordering::Relaxed);
+        if moved.moved > 0 || !moved.errors.is_empty() {
+            tracing::info!(moved = moved.moved, errors = ?moved.errors, "docs moved to new shards");
+        }
         let report = sync_all(&client, &groups).await;
         if !report.is_empty() {
             tracing::info!(
