@@ -20,12 +20,17 @@ function ufw_active
     sudo ufw status | string match -q "Status: active"
 end
 
+function alive
+    set -l pid (cat $argv[1] 2>/dev/null)
+    string match -qr '^\d+$' -- "$pid"; and test -d /proc/$pid
+end
+
 function running
-    test -f $pidfile; and kill -0 (cat $pidfile) 2>/dev/null
+    alive $pidfile
 end
 
 function guard_alive
-    test -f $guardfile; and kill -0 (cat $guardfile) 2>/dev/null
+    alive $guardfile
 end
 
 function say

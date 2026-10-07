@@ -21,7 +21,11 @@ ufw_active() {
 }
 
 alive() {
-    [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null
+    pid=$(cat "$1" 2>/dev/null)
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -d "/proc/$pid" ]
 }
 
 say() {
